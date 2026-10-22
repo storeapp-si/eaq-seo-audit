@@ -7,23 +7,27 @@ import sqlite3
 import ipaddress
 import logging
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, urlencode
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from html import escape
 
 import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 APP_NAME = "EAQ SEO Audit"
-APP_VERSION = "3.0.0"
+APP_VERSION = "4.0.0"
+
 MAX_URL_LENGTH = 2048
 MAX_HTML_BYTES = 2_000_000
 TIMEOUT = 12
 MAX_LINKS = 10
+
 DB_PATH = os.getenv("DATABASE_PATH", "/tmp/eaq_audit.sqlite3")
 PAGESPEED_API_KEY = os.getenv("PAGESPEED_API_KEY", "").strip()
+SIMILARWEB_API_KEY = os.getenv("SIMILARWEB_API_KEY", "").strip()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eaq")
@@ -31,286 +35,160 @@ logger = logging.getLogger("eaq")
 app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url=None, redoc_url=None)
 
 LANGUAGES = {
-    "en": "English",
     "ar": "العربية",
+    "en": "English",
     "fr": "Français",
     "es": "Español",
     "de": "Deutsch",
     "zh": "中文",
 }
 
-TEXT = {
-    "en": {
-        "language": "Language", "tagline": "Analyze. Automate. Improve.",
-        "heading": "Understand your website's SEO health",
-        "intro": "Analyze technical SEO, performance, sitemaps and links.",
-        "url": "Website URL", "audit": "Analyze website",
-        "results": "Audit report", "overall": "Checklist score",
-        "passed": "Passed checks", "issues": "Items to improve",
-        "details": "Detailed findings", "priorities": "Recommended priorities",
-        "history": "Saved reports", "no_history": "No saved reports yet.",
-        "date": "Date", "website": "Website", "score": "Score",
-        "actions": "Actions", "view": "View", "delete": "Delete",
-        "back": "New audit", "print": "Print / Save PDF",
-        "title": "Page title", "description": "Meta description",
-        "canonical": "Canonical URL", "headings": "Heading structure",
-        "images": "Image alt text", "https": "HTTPS",
-        "viewport": "Mobile viewport", "lang": "HTML language",
-        "schema": "Structured data", "social": "Social metadata",
-        "robots": "Robots meta directive", "business": "Business information",
-        "status": "Website status", "good": "Looks good",
-        "warning": "Review recommended", "speed": "Google PageSpeed Insights",
-        "sitemap": "Robots and sitemap", "link_check": "Sampled links",
-        "security": "Security and privacy",
-        "privacy": "Only public website URLs can be analyzed.",
-        "invalid": "Enter a valid public HTTP or HTTPS website URL.",
-        "error": "Unable to analyze this website.",
-        "error_detail": "Check the URL. The website may block automated requests.",
-        "footer": "Technical SEO guidance, not a guarantee of search ranking.",
-        "no_business": "No business details detected.",
-        "no_speed": "PageSpeed data is unavailable.",
-        "not_rank": "This is a checklist score, not a Google ranking score.",
-        "pdf_tip": "Choose Save as PDF in the print dialog.",
-        "saved": "Reports are saved automatically.",
-        "map": "Choose business location on the map",
-        "business_name": "Business name (optional)",
-        "address": "Business address (optional)",
-        "latitude": "Latitude", "longitude": "Longitude",
-        "map_help": "Click the map to select a location. You can also enter coordinates.",
-        "location": "Business location",
-        "no_location": "No business location provided.",
-        "no_field": "No Google field data is available for this URL or origin.",
-        "no_sitemap": "No sitemap was detected.",
-        "no_robots": "robots.txt could not be verified.",
-        "report_id": "Report ID",
-        "score_chart": "SEO score overview",
-        "performance_chart": "PageSpeed scores",
-        "high": "High", "medium": "Medium", "low": "Low",
-    },
+T = {
     "ar": {
-        "language": "اللغة", "tagline": "حلّل. أتمت. حسّن.",
-        "heading": "افهم الحالة التقنية لموقعك",
-        "intro": "فحص SEO التقني والسرعة وخريطة الموقع والروابط.",
-        "url": "رابط الموقع", "audit": "تحليل الموقع",
-        "results": "تقرير الفحص", "overall": "نتيجة قائمة الفحوصات",
-        "passed": "الفحوصات المستوفاة", "issues": "نقاط تحتاج إلى تحسين",
-        "details": "النتائج التفصيلية", "priorities": "أولويات التحسين",
-        "history": "التقارير المحفوظة", "no_history": "لا توجد تقارير محفوظة.",
-        "date": "التاريخ", "website": "الموقع", "score": "النتيجة",
-        "actions": "الإجراءات", "view": "عرض", "delete": "حذف",
-        "back": "تحليل جديد", "print": "طباعة / حفظ PDF",
-        "title": "عنوان الصفحة", "description": "الوصف التعريفي",
-        "canonical": "الرابط الأساسي Canonical", "headings": "بنية العناوين",
-        "images": "النص البديل للصور", "https": "اتصال HTTPS",
-        "viewport": "إعداد عرض الهاتف", "lang": "لغة HTML",
-        "schema": "البيانات المنظمة", "social": "بيانات المشاركة الاجتماعية",
-        "robots": "توجيهات Robots", "business": "معلومات النشاط التجاري",
-        "status": "حالة الموقع", "good": "جيد مبدئيًا",
-        "warning": "يُنصح بالمراجعة", "speed": "سرعة الموقع - Google PageSpeed",
-        "sitemap": "ملف Robots وخريطة الموقع", "link_check": "فحص عينة من الروابط",
+        "tagline": "حلّل. أتمت. حسّن.",
+        "heading": "افحص الحالة التقنية لموقعك",
+        "intro": "تحليل SEO والسرعة والروابط وعمر النطاق والتاريخ المتاح.",
+        "url": "رابط الموقع",
+        "audit": "تحليل الموقع",
+        "new": "تحليل جديد",
+        "report": "تقرير الفحص",
+        "score": "نتيجة SEO",
+        "passed": "الفحوصات المستوفاة",
+        "issues": "نقاط تحتاج إلى مراجعة",
+        "details": "النتائج التفصيلية",
+        "priorities": "أولويات التحسين",
+        "good": "جيد مبدئيًا",
+        "warning": "يُنصح بالمراجعة",
+        "title": "عنوان الصفحة",
+        "description": "الوصف التعريفي",
+        "canonical": "الرابط الأساسي Canonical",
+        "headings": "بنية العناوين",
+        "images": "النص البديل للصور",
+        "https": "اتصال HTTPS",
+        "viewport": "إعداد عرض الهاتف",
+        "html_lang": "لغة HTML",
+        "schema": "البيانات المنظمة",
+        "social": "بيانات المشاركة الاجتماعية",
+        "robots_meta": "توجيهات Robots",
+        "status": "حالة الموقع",
+        "speed": "سرعة الموقع - Google PageSpeed",
+        "sitemap": "ملف Robots وخريطة الموقع",
+        "links": "فحص عينة من الروابط",
+        "business": "فحص النشاط التجاري المحلي (اختياري)",
+        "business_enable": "تفعيل فحص النشاط التجاري المحلي",
+        "map_enable": "تحديد موقع النشاط على الخريطة (اختياري)",
+        "business_name": "اسم النشاط التجاري (اختياري)",
+        "address": "عنوان النشاط التجاري (اختياري)",
+        "latitude": "خط العرض",
+        "longitude": "خط الطول",
+        "map_help": "انقر على الخريطة لتحديد الموقع أو أدخل الإحداثيات يدويًا.",
+        "local_result": "نتائج الفحص المحلي",
+        "no_business": "لم تُكتشف بيانات واضحة لنشاط تجاري محلي.",
+        "no_location": "لم يُحدد موقع جغرافي؛ هذا لا يمنع فحص SEO العام.",
+        "domain_age": "عمر النطاق",
+        "created": "تاريخ إنشاء النطاق",
+        "unknown": "غير متاح",
+        "years": "سنة",
+        "history": "التاريخ السنوي للموقع",
+        "archive": "عدد لقطات Wayback Machine السنوية",
+        "visits": "الزيارات الشهرية المقدّرة",
+        "visitors": "الزوار الفريدون المقدّرون",
+        "no_visits": "لا تتوفر بيانات زيارات موثوقة لهذا النطاق.",
+        "no_archive": "لم تتوفر بيانات أرشيف تاريخية.",
+        "source": "المصدر",
+        "updated": "تاريخ جلب البيانات",
+        "speed_none": "بيانات PageSpeed غير متاحة.",
+        "not_rank": "هذه نتيجة قائمة فحوصات وليست ترتيبًا من Google.",
+        "print": "طباعة / حفظ PDF",
+        "saved": "يُحفظ التقرير تلقائيًا.",
+        "report_id": "رقم التقرير",
+        "history_reports": "التقارير المحفوظة",
+        "no_reports": "لا توجد تقارير محفوظة.",
+        "view": "عرض",
+        "delete": "حذف",
+        "date": "التاريخ",
+        "website": "الموقع",
+        "actions": "الإجراءات",
         "security": "الأمان والخصوصية",
         "privacy": "يمكن فحص روابط المواقع العامة فقط.",
         "invalid": "أدخل رابط HTTP أو HTTPS عامًا وصحيحًا.",
         "error": "تعذر فحص الموقع.",
-        "error_detail": "تحقق من الرابط؛ قد يمنع الموقع الطلبات الآلية.",
-        "footer": "إرشادات SEO تقنية ولا تضمن ترتيبًا معينًا في البحث.",
-        "no_business": "لم تُكتشف معلومات واضحة عن النشاط التجاري.",
-        "no_speed": "بيانات PageSpeed غير متاحة.",
-        "not_rank": "هذه نتيجة قائمة فحوصات وليست ترتيبًا من Google.",
-        "pdf_tip": "اختر حفظ بصيغة PDF من نافذة الطباعة.",
-        "saved": "تُحفظ التقارير تلقائيًا.",
-        "map": "اختر موقع النشاط التجاري على الخريطة",
-        "business_name": "اسم النشاط التجاري (اختياري)",
-        "address": "عنوان النشاط التجاري (اختياري)",
-        "latitude": "خط العرض", "longitude": "خط الطول",
-        "map_help": "انقر على الخريطة لاختيار الموقع، أو أدخل الإحداثيات يدويًا.",
-        "location": "موقع النشاط التجاري",
-        "no_location": "لم يُحدّد موقع للنشاط التجاري.",
-        "no_field": "لا تتوفر بيانات ميدانية من Google لهذا الرابط أو النطاق.",
+        "footer": "إرشادات تقنية لا تضمن ترتيبًا معينًا في نتائج البحث.",
+        "sample": "هذه عينة محدودة من الروابط؛ قد تمنع بعض المواقع الفحص الآلي.",
+        "not_checked": "لم يتم الفحص",
+        "no_robots": "لم يُعثر على robots.txt.",
         "no_sitemap": "لم تُكتشف خريطة موقع.",
-        "no_robots": "تعذر التحقق من robots.txt.",
-        "report_id": "رقم التقرير",
-        "score_chart": "ملخص نتيجة SEO",
-        "performance_chart": "درجات PageSpeed",
-        "high": "مرتفع", "medium": "متوسط", "low": "منخفض",
+        "local_note": "الفحص المحلي اختياري. لا تدخل بيانات موقع لا تملك حق استخدامها.",
     },
-    "fr": {
-        "language": "Langue", "tagline": "Analyser. Automatiser. Améliorer.",
-        "heading": "Comprenez la santé SEO de votre site",
-        "intro": "Analyse technique SEO, vitesse, sitemap et liens.",
-        "url": "URL du site", "audit": "Analyser le site",
-        "results": "Rapport d'audit", "overall": "Score de contrôle",
-        "passed": "Contrôles réussis", "issues": "Points à améliorer",
-        "details": "Résultats détaillés", "priorities": "Priorités recommandées",
-        "history": "Rapports enregistrés", "no_history": "Aucun rapport enregistré.",
-        "date": "Date", "website": "Site", "score": "Score",
-        "actions": "Actions", "view": "Voir", "delete": "Supprimer",
-        "back": "Nouvel audit", "print": "Imprimer / Enregistrer PDF",
-        "title": "Titre de la page", "description": "Méta-description",
-        "canonical": "URL canonique", "headings": "Structure des titres",
-        "images": "Textes alternatifs", "https": "HTTPS",
-        "viewport": "Affichage mobile", "lang": "Langue HTML",
-        "schema": "Données structurées", "social": "Métadonnées sociales",
-        "robots": "Directive robots", "business": "Informations commerciales",
-        "status": "État du site", "good": "Semble correct",
-        "warning": "Vérification recommandée", "speed": "Google PageSpeed Insights",
-        "sitemap": "Robots et sitemap", "link_check": "Liens échantillonnés",
-        "security": "Sécurité et confidentialité",
-        "privacy": "Seules les URL publiques peuvent être analysées.",
-        "invalid": "Saisissez une URL publique HTTP ou HTTPS valide.",
-        "error": "Impossible d'analyser le site.",
-        "error_detail": "Vérifiez l'URL. Le site peut bloquer les requêtes automatiques.",
-        "footer": "Conseils SEO techniques, sans garantie de classement.",
-        "no_business": "Aucune information commerciale détectée.",
-        "no_speed": "Données PageSpeed indisponibles.",
-        "not_rank": "Ce score n'est pas un classement Google.",
-        "pdf_tip": "Choisissez Enregistrer en PDF dans la fenêtre d'impression.",
-        "saved": "Les rapports sont enregistrés automatiquement.",
-        "map": "Choisir l'emplacement sur la carte",
-        "business_name": "Nom de l'entreprise (facultatif)",
-        "address": "Adresse (facultatif)", "latitude": "Latitude",
+    "en": {
+        "tagline": "Analyze. Automate. Improve.",
+        "heading": "Understand your website's SEO health",
+        "intro": "Check technical SEO, speed, links, domain age and available history.",
+        "url": "Website URL", "audit": "Analyze website", "new": "New audit",
+        "report": "Audit report", "score": "SEO score",
+        "passed": "Passed checks", "issues": "Items to review",
+        "details": "Detailed findings", "priorities": "Recommended priorities",
+        "good": "Looks good", "warning": "Review recommended",
+        "title": "Page title", "description": "Meta description",
+        "canonical": "Canonical URL", "headings": "Heading structure",
+        "images": "Image alt text", "https": "HTTPS",
+        "viewport": "Mobile viewport", "html_lang": "HTML language",
+        "schema": "Structured data", "social": "Social metadata",
+        "robots_meta": "Robots directives", "status": "Website status",
+        "speed": "Google PageSpeed Insights", "sitemap": "Robots and sitemap",
+        "links": "Sampled links", "business": "Local business audit (optional)",
+        "business_enable": "Enable local business audit",
+        "map_enable": "Set business location on map (optional)",
+        "business_name": "Business name (optional)",
+        "address": "Business address (optional)", "latitude": "Latitude",
         "longitude": "Longitude",
-        "map_help": "Cliquez sur la carte pour choisir l'emplacement.",
-        "location": "Emplacement de l'entreprise",
-        "no_location": "Aucun emplacement fourni.",
-        "no_field": "Aucune donnée Google disponible.",
-        "no_sitemap": "Aucun sitemap détecté.",
-        "no_robots": "robots.txt non vérifié.",
-        "report_id": "Rapport", "score_chart": "Aperçu du score SEO",
-        "performance_chart": "Scores PageSpeed",
-        "high": "Élevé", "medium": "Moyen", "low": "Faible",
-    },
-    "es": {
-        "language": "Idioma", "tagline": "Analiza. Automatiza. Mejora.",
-        "heading": "Comprende la salud SEO de tu sitio",
-        "intro": "SEO técnico, velocidad, sitemap y enlaces.",
-        "url": "URL del sitio", "audit": "Analizar sitio",
-        "results": "Informe de auditoría", "overall": "Puntuación de comprobación",
-        "passed": "Comprobaciones correctas", "issues": "Aspectos por mejorar",
-        "details": "Resultados detallados", "priorities": "Prioridades recomendadas",
-        "history": "Informes guardados", "no_history": "Todavía no hay informes.",
-        "date": "Fecha", "website": "Sitio", "score": "Puntuación",
-        "actions": "Acciones", "view": "Ver", "delete": "Eliminar",
-        "back": "Nueva auditoría", "print": "Imprimir / Guardar PDF",
-        "title": "Título de página", "description": "Meta descripción",
-        "canonical": "URL canónica", "headings": "Estructura de encabezados",
-        "images": "Texto alternativo", "https": "HTTPS",
-        "viewport": "Vista móvil", "lang": "Idioma HTML",
-        "schema": "Datos estructurados", "social": "Metadatos sociales",
-        "robots": "Directiva robots", "business": "Información comercial",
-        "status": "Estado del sitio", "good": "Parece correcto",
-        "warning": "Se recomienda revisar", "speed": "Google PageSpeed Insights",
-        "sitemap": "Robots y sitemap", "link_check": "Enlaces muestreados",
-        "security": "Seguridad y privacidad",
-        "privacy": "Solo se pueden analizar URL públicas.",
-        "invalid": "Introduce una URL pública HTTP o HTTPS válida.",
-        "error": "No se pudo analizar el sitio.",
-        "error_detail": "Comprueba la URL; el sitio puede bloquear solicitudes automáticas.",
-        "footer": "Consejos técnicos SEO, sin garantía de posicionamiento.",
-        "no_business": "No se detectó información comercial.",
-        "no_speed": "Datos de PageSpeed no disponibles.",
-        "not_rank": "Esta puntuación no es un ranking de Google.",
-        "pdf_tip": "Elige Guardar como PDF en el diálogo de impresión.",
-        "saved": "Los informes se guardan automáticamente.",
-        "map": "Elegir ubicación en el mapa",
-        "business_name": "Nombre comercial (opcional)",
-        "address": "Dirección (opcional)", "latitude": "Latitud",
-        "longitude": "Longitud",
-        "map_help": "Haz clic en el mapa para seleccionar la ubicación.",
-        "location": "Ubicación comercial", "no_location": "No se indicó ubicación.",
-        "no_field": "No hay datos de Google disponibles.",
-        "no_sitemap": "No se detectó sitemap.", "no_robots": "No se pudo verificar robots.txt.",
-        "report_id": "Informe", "score_chart": "Resumen de puntuación SEO",
-        "performance_chart": "Puntuaciones PageSpeed",
-        "high": "Alto", "medium": "Medio", "low": "Bajo",
-    },
-    "de": {
-        "language": "Sprache", "tagline": "Analysieren. Automatisieren. Verbessern.",
-        "heading": "Verstehen Sie den SEO-Zustand Ihrer Website",
-        "intro": "Technisches SEO, Geschwindigkeit, Sitemap und Links prüfen.",
-        "url": "Website-URL", "audit": "Website analysieren",
-        "results": "Auditbericht", "overall": "Prüfpunktzahl",
-        "passed": "Bestandene Prüfungen", "issues": "Verbesserungspunkte",
-        "details": "Detaillierte Ergebnisse", "priorities": "Empfohlene Prioritäten",
-        "history": "Gespeicherte Berichte", "no_history": "Noch keine Berichte.",
-        "date": "Datum", "website": "Website", "score": "Punktzahl",
-        "actions": "Aktionen", "view": "Anzeigen", "delete": "Löschen",
-        "back": "Neues Audit", "print": "Drucken / PDF speichern",
-        "title": "Seitentitel", "description": "Meta-Beschreibung",
-        "canonical": "Kanonische URL", "headings": "Überschriftenstruktur",
-        "images": "Alternativtexte", "https": "HTTPS",
-        "viewport": "Mobile Ansicht", "lang": "HTML-Sprache",
-        "schema": "Strukturierte Daten", "social": "Social-Metadaten",
-        "robots": "Robots-Direktive", "business": "Unternehmensinformationen",
-        "status": "Website-Status", "good": "Sieht gut aus",
-        "warning": "Überprüfung empfohlen", "speed": "Google PageSpeed Insights",
-        "sitemap": "Robots und Sitemap", "link_check": "Stichprobenlinks",
-        "security": "Sicherheit und Datenschutz",
-        "privacy": "Nur öffentliche URLs können analysiert werden.",
-        "invalid": "Geben Sie eine gültige öffentliche HTTP- oder HTTPS-URL ein.",
-        "error": "Website konnte nicht analysiert werden.",
-        "error_detail": "URL prüfen; die Website kann automatisierte Anfragen blockieren.",
-        "footer": "Technische SEO-Hinweise, keine Ranking-Garantie.",
-        "no_business": "Keine Unternehmensdaten erkannt.",
-        "no_speed": "PageSpeed-Daten nicht verfügbar.",
-        "not_rank": "Diese Punktzahl ist kein Google-Ranking.",
-        "pdf_tip": "Im Druckdialog Als PDF speichern wählen.",
-        "saved": "Berichte werden automatisch gespeichert.",
-        "map": "Standort auf der Karte auswählen",
-        "business_name": "Unternehmensname (optional)",
-        "address": "Adresse (optional)", "latitude": "Breitengrad",
-        "longitude": "Längengrad",
-        "map_help": "Klicken Sie auf die Karte, um einen Standort auszuwählen.",
-        "location": "Unternehmensstandort", "no_location": "Kein Standort angegeben.",
-        "no_field": "Keine Google-Daten verfügbar.", "no_sitemap": "Keine Sitemap erkannt.",
-        "no_robots": "robots.txt konnte nicht geprüft werden.",
-        "report_id": "Bericht", "score_chart": "SEO-Punktzahl",
-        "performance_chart": "PageSpeed-Werte",
-        "high": "Hoch", "medium": "Mittel", "low": "Niedrig",
-    },
-    "zh": {
-        "language": "语言", "tagline": "分析。自动化。改进。",
-        "heading": "了解网站的 SEO 状况", "intro": "检查技术 SEO、速度、站点地图和链接。",
-        "url": "网站网址", "audit": "分析网站", "results": "审计报告",
-        "overall": "检查得分", "passed": "通过的检查", "issues": "待改进项目",
-        "details": "详细结果", "priorities": "建议优先事项",
-        "history": "已保存报告", "no_history": "暂无报告。",
-        "date": "日期", "website": "网站", "score": "得分",
-        "actions": "操作", "view": "查看", "delete": "删除",
-        "back": "新建审计", "print": "打印 / 保存 PDF",
-        "title": "页面标题", "description": "元描述", "canonical": "规范网址",
-        "headings": "标题结构", "images": "图片替代文本", "https": "HTTPS",
-        "viewport": "移动视口", "lang": "HTML 语言", "schema": "结构化数据",
-        "social": "社交元数据", "robots": "Robots 指令", "business": "商业信息",
-        "status": "网站状态", "good": "看起来正常", "warning": "建议检查",
-        "speed": "Google PageSpeed Insights", "sitemap": "Robots 与站点地图",
-        "link_check": "抽样链接", "security": "安全与隐私",
-        "privacy": "只能分析公开网址。", "invalid": "请输入有效的公开 HTTP 或 HTTPS 网址。",
-        "error": "无法分析网站。", "error_detail": "请检查网址；网站可能阻止自动请求。",
-        "footer": "提供技术 SEO 建议，不保证搜索排名。",
-        "no_business": "未检测到商业信息。", "no_speed": "PageSpeed 数据不可用。",
-        "not_rank": "此分数不是 Google 排名。", "pdf_tip": "在打印窗口中选择保存为 PDF。",
-        "saved": "报告会自动保存。", "map": "在地图上选择位置",
-        "business_name": "企业名称（可选）", "address": "地址（可选）",
-        "latitude": "纬度", "longitude": "经度",
-        "map_help": "点击地图选择位置。", "location": "企业位置",
-        "no_location": "未提供位置。", "no_field": "没有可用的 Google 数据。",
-        "no_sitemap": "未检测到站点地图。", "no_robots": "无法验证 robots.txt。",
-        "report_id": "报告编号", "score_chart": "SEO 得分概览",
-        "performance_chart": "PageSpeed 得分",
-        "high": "高", "medium": "中", "low": "低",
+        "map_help": "Click the map or enter coordinates manually.",
+        "local_result": "Local audit results",
+        "no_business": "No clear local business details detected.",
+        "no_location": "No location provided; general SEO analysis is unaffected.",
+        "domain_age": "Domain age", "created": "Domain creation date",
+        "unknown": "Unavailable", "years": "years",
+        "history": "Website history by year",
+        "archive": "Annual Wayback Machine snapshots",
+        "visits": "Estimated monthly visits",
+        "visitors": "Estimated unique visitors",
+        "no_visits": "No reliable traffic data is available for this domain.",
+        "no_archive": "No historical archive data was found.",
+        "source": "Source", "updated": "Data retrieved",
+        "speed_none": "PageSpeed data is unavailable.",
+        "not_rank": "This is a checklist score, not a Google ranking.",
+        "print": "Print / Save PDF", "saved": "Reports are saved automatically.",
+        "report_id": "Report ID", "history_reports": "Saved reports",
+        "no_reports": "No saved reports.", "view": "View", "delete": "Delete",
+        "date": "Date", "website": "Website", "actions": "Actions",
+        "security": "Security and privacy",
+        "privacy": "Only public website URLs can be analyzed.",
+        "invalid": "Enter a valid public HTTP or HTTPS URL.",
+        "error": "Unable to analyze this website.",
+        "footer": "Technical guidance does not guarantee search rankings.",
+        "sample": "Only a limited sample is checked; some servers block automated requests.",
+        "not_checked": "Not checked", "no_robots": "robots.txt was not found.",
+        "no_sitemap": "No sitemap was detected.",
+        "local_note": "Local audit is optional. Only submit business details you are authorized to use.",
     },
 }
 
+# Missing French, Spanish, German and Chinese keys fall back to English.
+for _lang in ("fr", "es", "de", "zh"):
+    T[_lang] = dict(T["en"])
+
 
 def tr(lang, key):
-    lang = lang if lang in TEXT else "en"
-    return TEXT[lang].get(key, TEXT["en"].get(key, key))
+    lang = lang if lang in T else "en"
+    return T[lang].get(key, T["en"].get(key, key))
 
 
 def esc(value):
-    from html import escape
     return escape(str(value if value is not None else ""), quote=True)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 # ---------------- Database ----------------
@@ -318,29 +196,27 @@ def esc(value):
 def get_db():
     folder = os.path.dirname(DB_PATH)
     if folder:
-        try:
-            os.makedirs(folder, exist_ok=True)
-        except OSError:
-            pass
+        os.makedirs(folder, exist_ok=True)
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=10)
+        db = sqlite3.connect(DB_PATH, timeout=10)
     except sqlite3.OperationalError:
-        conn = sqlite3.connect("/tmp/eaq_audit.sqlite3", timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
+        db = sqlite3.connect("/tmp/eaq_audit.sqlite3", timeout=10)
+    db.row_factory = sqlite3.Row
+    return db
 
 
 def init_db():
     with get_db() as db:
         db.execute("""
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT NOT NULL,
-            title TEXT,
-            score INTEGER NOT NULL,
-            report_json TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )""")
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT NOT NULL,
+                title TEXT,
+                score INTEGER NOT NULL,
+                report_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
         db.commit()
 
 
@@ -377,14 +253,19 @@ def validate_public_url(raw):
         raise ValueError("Invalid URL")
     if "://" not in raw:
         raw = "https://" + raw
+
     parsed = urlparse(raw)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError("Invalid scheme")
+        raise ValueError("Invalid URL scheme")
     if parsed.username or parsed.password:
-        raise ValueError("Credentials not allowed")
+        raise ValueError("Credentials are not allowed")
+
     host = parsed.hostname.rstrip(".").lower()
-    if host == "localhost" or host.endswith((".localhost", ".local", ".internal", ".test")):
+    if host == "localhost" or host.endswith(
+        (".localhost", ".local", ".internal", ".test")
+    ):
         raise ValueError("Private hostname")
+
     try:
         ip = ipaddress.ip_address(host)
         if not ip.is_global:
@@ -393,704 +274,1013 @@ def validate_public_url(raw):
         if str(exc) == "Non-public IP":
             raise
         try:
-            records = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
-        except socket.gaierror as err:
-            raise ValueError("DNS lookup failed") from err
-        for rec in records:
-            address = ipaddress.ip_address(rec[4][0].split("%")[0])
-            if not address.is_global:
+            addresses = socket.getaddrinfo(host, None)
+        except socket.gaierror:
+            raise ValueError("Hostname could not be resolved")
+        for item in addresses:
+            addr = ipaddress.ip_address(item[4][0])
+            if not addr.is_global:
                 raise ValueError("Hostname resolves to a non-public IP")
+
+    if parsed.port and parsed.port not in (80, 443):
+        raise ValueError("Unsupported port")
+
     return raw
 
 
-def safe_get(url, allow_redirects=False, max_bytes=MAX_HTML_BYTES):
-    url = validate_public_url(url)
-    response = requests.get(
-        url,
-        timeout=TIMEOUT,
-        allow_redirects=allow_redirects,
-        headers={"User-Agent": "EAQ-SEO-Audit/3.0 (+public technical audit)"},
-        stream=True,
-    )
-    chunks = []
-    size = 0
-    for chunk in response.iter_content(16384):
-        if not chunk:
-            continue
-        size += len(chunk)
-        if size > max_bytes:
-            response.close()
-            raise ValueError("Response too large")
-        chunks.append(chunk)
-    response._content = b"".join(chunks)
-    response._content_consumed = True
-    return response
+def safe_get(raw_url, max_redirects=4, stream=False):
+    current = validate_public_url(raw_url)
+    headers = {
+        "User-Agent": "EAQ-SEO-Audit/4.0 (+public website technical checker)",
+        "Accept": "text/html,application/xhtml+xml,application/xml,text/plain,*/*",
+    }
 
-
-def fetch_page(url):
-    current = validate_public_url(url)
-    for _ in range(6):
-        response = safe_get(current, allow_redirects=False)
-        if response.is_redirect or response.is_permanent_redirect:
+    for _ in range(max_redirects + 1):
+        current = validate_public_url(current)
+        response = requests.get(
+            current,
+            headers=headers,
+            timeout=TIMEOUT,
+            allow_redirects=False,
+            stream=stream,
+        )
+        if response.status_code in (301, 302, 303, 307, 308):
             location = response.headers.get("Location")
             response.close()
             if not location:
-                break
-            current = validate_public_url(urljoin(current, location))
+                return None
+            current = urljoin(current, location)
             continue
-        response.encoding = response.encoding or "utf-8"
-        return {
-            "url": response.url,
-            "status": response.status_code,
-            "html": response.text,
-        }
+        return response
+
     raise ValueError("Too many redirects")
 
 
-# ---------------- SEO analysis ----------------
+def fetch_page(url):
+    response = safe_get(url, stream=True)
+    if response is None:
+        raise ValueError("No response")
 
-def audit_html(url, html, status):
-    soup = BeautifulSoup(html, "html.parser")
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "html" not in content_type and "xhtml" not in content_type:
+        response.close()
+        raise ValueError("The URL did not return HTML")
+
+    chunks = []
+    total = 0
+    for chunk in response.iter_content(65536):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > MAX_HTML_BYTES:
+            response.close()
+            raise ValueError("HTML document is too large")
+        chunks.append(chunk)
+
+    final_url = response.url
+    status_code = response.status_code
+    response.close()
+
+    raw = b"".join(chunks)
+    soup = BeautifulSoup(raw, "html.parser")
+    return final_url, status_code, soup
+
+
+# ---------------- SEO checks ----------------
+
+def meta_content(soup, name=None, prop=None):
+    for tag in soup.find_all("meta"):
+        if name and (tag.get("name") or "").lower() == name.lower():
+            return (tag.get("content") or "").strip()
+        if prop and (tag.get("property") or "").lower() == prop.lower():
+            return (tag.get("content") or "").strip()
+    return ""
+
+
+def analyze_page(url):
+    final_url, status, soup = fetch_page(url)
+    checks = []
+
+    def add(label, passed, detail):
+        checks.append({
+            "label": label,
+            "passed": bool(passed),
+            "detail": str(detail),
+        })
+
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
-    description_tag = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
-    description = description_tag.get("content", "").strip() if description_tag else ""
-    canonical_tag = soup.find("link", rel=lambda v: v and "canonical" in str(v).lower())
+    description = meta_content(soup, name="description")
+    canonical_tag = soup.find("link", rel=lambda x: x and "canonical" in x)
     canonical = canonical_tag.get("href", "").strip() if canonical_tag else ""
     h1s = soup.find_all("h1")
-    images = soup.find_all("img")
-    missing_alt = sum(1 for img in images if img.get("alt") is None or not img.get("alt", "").strip())
-    viewport = soup.find("meta", attrs={"name": re.compile("^viewport$", re.I)})
-    html_lang = soup.html.get("lang", "") if soup.html else ""
-    jsonld = soup.find_all("script", attrs={"type": re.compile("ld\\+json", re.I)})
-    social = soup.find("meta", property=re.compile("^(og:|twitter:)", re.I))
-    robots_meta = soup.find("meta", attrs={"name": re.compile("^robots$", re.I)})
-    business = {}
-    for tag in soup.find_all("script", attrs={"type": re.compile("ld\\+json", re.I)}):
-        try:
-            data = json.loads(tag.string or tag.get_text())
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                if isinstance(item, dict) and item.get("@type"):
-                    typ = item.get("@type")
-                    if any(x in str(typ).lower() for x in ("organization", "localbusiness", "store", "professionalservice")):
-                        business["Name"] = item.get("name", "")
-                        business["Address"] = item.get("address", "")
-                        business["Website"] = item.get("url", "")
-                        break
-        except Exception:
-            pass
+    imgs = soup.find_all("img")
+    missing_alt = sum(1 for img in imgs if img.get("alt") is None)
+    viewport = meta_content(soup, name="viewport")
+    html_lang = (soup.html.get("lang", "") if soup.html else "").strip()
+    robots = meta_content(soup, name="robots")
+    jsonld = soup.find_all("script", type="application/ld+json")
+    social = bool(
+        meta_content(soup, prop="og:title")
+        or meta_content(soup, prop="og:description")
+        or meta_content(soup, name="twitter:card")
+    )
 
-    checks = [
-        ("title", bool(title), title or "No page title detected."),
-        ("description", bool(description), description or "No meta description detected."),
-        ("canonical", bool(canonical), canonical or "No canonical link detected."),
-        ("headings", len(h1s) == 1, f"{len(h1s)} H1 heading(s)"),
-        ("images", missing_alt == 0, f"{missing_alt} image(s) without alt out of {len(images)}"),
-        ("https", urlparse(url).scheme == "https", urlparse(url).scheme.upper()),
-        ("viewport", bool(viewport), "Viewport metadata present" if viewport else "Viewport metadata missing"),
-        ("lang", bool(html_lang), html_lang or "HTML lang attribute missing"),
-        ("schema", bool(jsonld), f"{len(jsonld)} JSON-LD block(s)"),
-        ("social", bool(social), "Social metadata present" if social else "Social metadata missing"),
-        ("robots", bool(robots_meta), "Robots meta directive present" if robots_meta else "No robots meta directive"),
-        ("business", bool(business), "Business structured data detected" if business else "No business details detected."),
-        ("status", 200 <= status < 400, f"HTTP {status}"),
-    ]
-    results = [{"key": k, "ok": ok, "details": detail} for k, ok, detail in checks]
-    passed = sum(1 for item in results if item["ok"])
-    score = round(100 * passed / len(results))
-    priorities = []
-    for item in results:
-        if item["ok"]:
+    # Absence of a robots meta tag is not itself an SEO error.
+    robots_ok = not robots or not re.search(r"\bnoindex\b", robots, re.I)
+
+    add("Page title", bool(title), title or "Missing page title")
+    add("Meta description", bool(description), description or "Missing meta description")
+    add("Canonical URL", bool(canonical), canonical or "No canonical link detected")
+    add("Heading structure", len(h1s) == 1, f"{len(h1s)} H1 heading(s)")
+    add("Image alt text", missing_alt == 0, f"{missing_alt} image(s) without alt out of {len(imgs)}")
+    add("HTTPS", final_url.lower().startswith("https://"), final_url)
+    add("Mobile viewport", bool(viewport), "Viewport metadata present" if viewport else "Viewport metadata missing")
+    add("HTML language", bool(html_lang), html_lang or "HTML lang attribute missing")
+    add("Structured data", bool(jsonld), f"{len(jsonld)} JSON-LD block(s)")
+    add("Social metadata", social, "Social metadata present" if social else "Social metadata missing")
+    add("Robots directives", robots_ok, robots or "No restrictive robots meta directive detected")
+    add("Website status", 200 <= status < 400, f"HTTP {status}")
+
+    business_types = (
+        "LocalBusiness", "Organization", "ProfessionalService", "Store",
+        "MedicalBusiness", "Corporation", "HomeAndConstructionBusiness",
+    )
+    business_detected = False
+    for block in jsonld:
+        try:
+            data = json.loads(block.string or block.get_text())
+            stack = data if isinstance(data, list) else [data]
+            while stack:
+                obj = stack.pop()
+                if not isinstance(obj, dict):
+                    continue
+                typ = obj.get("@type", [])
+                if isinstance(typ, str):
+                    typ = [typ]
+                if any(any(bt.lower() in str(x).lower() for bt in business_types) for x in typ):
+                    business_detected = True
+                graph = obj.get("@graph")
+                if isinstance(graph, list):
+                    stack.extend(graph)
+        except Exception:
             continue
-        priority = "high" if item["key"] == "description" else "medium"
-        priorities.append({
-            "key": item["key"],
-            "priority": priority,
-            "details": item["details"],
-        })
+
+    # General SEO score excludes local business information.
+    passed = sum(1 for c in checks if c["passed"])
+    score = round(100 * passed / max(1, len(checks)))
 
     links = []
     seen = set()
     for a in soup.find_all("a", href=True):
-        target = urljoin(url, a["href"].strip())
-        parsed = urlparse(target)
-        if parsed.scheme in ("http", "https") and target not in seen:
-            seen.add(target)
-            links.append(target)
+        href = urljoin(final_url, a["href"].strip())
+        p = urlparse(href)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        links.append(href)
         if len(links) >= MAX_LINKS:
             break
 
     return {
-        "url": url, "title": title, "score": score,
-        "passed": passed, "total": len(results),
-        "checks": results, "priorities": priorities,
-        "business": business, "sample_links": links,
+        "url": url,
+        "final_url": final_url,
+        "http_status": status,
+        "title": title,
+        "description": description,
+        "canonical": canonical,
+        "score": score,
+        "passed": passed,
+        "total_checks": len(checks),
+        "checks": checks,
+        "links": links,
+        "business_detected": business_detected,
+        "html_lang": html_lang,
     }
 
 
-# ---------------- External checks ----------------
-
-def check_resource(url):
+def check_one_link(url):
     try:
-        response = safe_get(url, max_bytes=500_000)
-        status = response.status_code
-        response.close()
-        return {"url": url, "status": status, "ok": 200 <= status < 400}
-    except Exception:
-        return {"url": url, "status": None, "ok": False}
+        r = safe_get(url, max_redirects=3)
+        if r is None:
+            return {"url": url, "status": 0, "result": "No response"}
+        status = r.status_code
+        r.close()
+        return {"url": url, "status": status, "result": "OK" if status < 400 else "Review"}
+    except Exception as exc:
+        return {"url": url, "status": 0, "result": type(exc).__name__}
 
 
-def robots_sitemap(url):
-    parsed = urlparse(url)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    robots = check_resource(origin + "/robots.txt")
-    candidates = [origin + "/sitemap.xml"]
-    if robots["ok"]:
+def check_robots_sitemap(site_url):
+    p = urlparse(site_url)
+    base = f"{p.scheme}://{p.netloc}"
+    robots_url = base + "/robots.txt"
+    sitemap_url = base + "/sitemap.xml"
+
+    out = {"robots": None, "sitemap": None}
+    for key, target in (("robots", robots_url), ("sitemap", sitemap_url)):
         try:
-            r = safe_get(origin + "/robots.txt", max_bytes=200_000)
-            for line in r.text.splitlines():
-                if line.lower().startswith("sitemap:"):
-                    sitemap = line.split(":", 1)[1].strip()
-                    if sitemap.startswith("http"):
-                        candidates.insert(0, sitemap)
-            r.close()
+            r = safe_get(target, max_redirects=3)
+            if r:
+                out[key] = {"url": target, "status": r.status_code}
+                r.close()
         except Exception:
-            pass
-    results = []
-    for item in list(dict.fromkeys(candidates))[:5]:
-        results.append(check_resource(item))
-    return {"robots": robots, "sitemaps": results}
+            out[key] = {"url": target, "status": 0}
+    return out
 
 
-def check_link(url):
-    try:
-        response = requests.head(
-            validate_public_url(url), timeout=8, allow_redirects=False,
-            headers={"User-Agent": "EAQ-SEO-Audit/3.0"}
-        )
-        status = response.status_code
-        response.close()
-        if status in (403, 405, 429, 501) or status >= 500:
-            return {"url": url, "status": status, "state": "Review"}
-        return {"url": url, "status": status, "state": "OK" if 200 <= status < 400 else "Broken"}
-    except Exception:
-        return {"url": url, "status": None, "state": "Unavailable"}
-
-
-def pagespeed_check(url):
-    params = {"url": url, "strategy": "mobile"}
+def pagespeed_data(url):
+    params = {"url": url, "category": ["PERFORMANCE", "SEO"]}
     if PAGESPEED_API_KEY:
         params["key"] = PAGESPEED_API_KEY
+
     try:
-        response = requests.get(
-            "https://www.googleapis.com/pagespeedonline/v5/runPagespeed",
-            params=params, timeout=35
-        )
-        if response.status_code != 200:
-            return {"available": False, "scores": {}, "lab": {}}
-        data = response.json()
-        lighthouse = data.get("lighthouseResult", {})
-        categories = lighthouse.get("categories", {})
-        scores = {}
-        for key in ("performance", "accessibility", "best-practices", "seo"):
-            value = categories.get(key, {}).get("score")
-            if value is not None:
-                scores[key] = round(value * 100)
-        lab = {}
-        audits = lighthouse.get("audits", {})
-        for key in ("first-contentful-paint", "largest-contentful-paint",
-                    "total-blocking-time", "cumulative-layout-shift", "speed-index"):
-            if key in audits:
-                lab[key.replace("-", " ").title()] = audits[key].get("displayValue", "")
-        return {"available": bool(scores), "scores": scores, "lab": lab}
-    except Exception:
-        return {"available": False, "scores": {}, "lab": {}}
-
-
-def run_external_checks(url, report):
-    report["robots_sitemap"] = robots_sitemap(url)
-    results = []
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [pool.submit(check_link, link) for link in report.get("sample_links", [])]
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception:
-                pass
-    report["link_results"] = sorted(results, key=lambda x: x["url"])
-    report["pagespeed"] = pagespeed_check(url)
-    return report
-
-
-# ---------------- Report storage ----------------
-
-def save_report(report):
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with get_db() as db:
-        cursor = db.execute(
-            "INSERT INTO reports(url,title,score,report_json,created_at) VALUES(?,?,?,?,?)",
-            (report["url"], report.get("title", ""), report["score"],
-             json.dumps(report, ensure_ascii=False), now)
-        )
-        report_id = cursor.lastrowid
-        db.commit()
-    report["report_id"] = report_id
-    report["created_at"] = now
-    with get_db() as db:
-        db.execute(
-            "UPDATE reports SET report_json=? WHERE id=?",
-            (json.dumps(report, ensure_ascii=False), report_id)
-        )
-        db.commit()
-    return report_id
-
-
-def get_report(report_id):
-    with get_db() as db:
-        row = db.execute("SELECT report_json FROM reports WHERE id=?", (report_id,)).fetchone()
-    if not row:
-        return None
-    try:
-        return json.loads(row["report_json"])
+        endpoint = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+        r = requests.get(endpoint, params=params, timeout=25)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        cats = data.get("lighthouseResult", {}).get("categories", {})
+        result = {}
+        for key in ("performance", "seo"):
+            item = cats.get(key)
+            if item and item.get("score") is not None:
+                result[key] = round(item["score"] * 100)
+        return result or None
     except Exception:
         return None
 
 
-def get_history():
-    with get_db() as db:
-        return db.execute(
-            "SELECT id,url,title,score,created_at FROM reports ORDER BY id DESC LIMIT 100"
-        ).fetchall()
+# ---------------- Domain age and history ----------------
+
+def get_domain_age(url):
+    host = (urlparse(url).hostname or "").lower().strip(".")
+    if not host:
+        return {"domain": "", "created": None, "age_days": None, "age_years": None, "source": "RDAP"}
+
+    # IP addresses do not have domain registration dates.
+    try:
+        ipaddress.ip_address(host)
+        return {"domain": host, "created": None, "age_days": None, "age_years": None, "source": "RDAP"}
+    except ValueError:
+        pass
+
+    try:
+        r = requests.get(
+            "https://rdap.org/domain/" + host,
+            headers={"User-Agent": "EAQ-SEO-Audit/4.0"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return {"domain": host, "created": None, "age_days": None, "age_years": None, "source": "RDAP"}
+        data = r.json()
+        created = None
+        for event in data.get("events", []):
+            if event.get("eventAction", "").lower() == "registration":
+                created = event.get("eventDate")
+                break
+        if not created:
+            return {"domain": host, "created": None, "age_days": None, "age_years": None, "source": "RDAP"}
+        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        days = max(0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).days)
+        return {
+            "domain": host,
+            "created": dt.date().isoformat(),
+            "age_days": days,
+            "age_years": round(days / 365.2425, 1),
+            "source": "RDAP",
+        }
+    except Exception:
+        return {"domain": host, "created": None, "age_days": None, "age_years": None, "source": "RDAP"}
 
 
-# ---------------- HTML helpers ----------------
+def get_wayback_history(url):
+    host = (urlparse(url).hostname or "").lower()
+    if not host:
+        return []
+    try:
+        params = {
+            "url": host + "/*",
+            "output": "json",
+            "fl": "timestamp",
+            "filter": "statuscode:200",
+            "collapse": "timestamp:4",
+        }
+        r = requests.get(
+            "https://web.archive.org/cdx/search/cdx",
+            params=params,
+            timeout=18,
+            headers={"User-Agent": "EAQ-SEO-Audit/4.0"},
+        )
+        if r.status_code != 200:
+            return []
+        rows = r.json()
+        years = {}
+        for row in rows[1:]:
+            if not row or not row[0] or len(row[0]) < 4:
+                continue
+            year = row[0][:4]
+            if year.isdigit():
+                years[year] = years.get(year, 0) + 1
+        return [{"year": y, "count": years[y]} for y in sorted(years)]
+    except Exception:
+        return []
 
-def page_shell(content, lang="en", title=APP_NAME):
-    options = "".join(
-        f'<option value="{code}" {"selected" if code == lang else ""}>{esc(name)}</option>'
-        for code, name in LANGUAGES.items()
+
+def get_similarweb_data(url):
+    if not SIMILARWEB_API_KEY:
+        return None
+
+    host = (urlparse(url).hostname or "").lower()
+    endpoint = f"https://api.similarweb.com/v1/website/{host}/total-traffic-and-engagement/visits"
+    params = {
+        "api_key": SIMILARWEB_API_KEY,
+        "start_date": "2025-01",
+        "end_date": datetime.now().strftime("%Y-%m"),
+        "granularity": "monthly",
+        "main_domain_only": "true",
+        "format": "json",
+    }
+
+    try:
+        r = requests.get(endpoint, params=params, timeout=20)
+        if r.status_code != 200:
+            logger.info("Similarweb API unavailable: %s", r.status_code)
+            return None
+        data = r.json()
+        items = data.get("visits", [])
+        rows = []
+        for item in items:
+            date = item.get("date")
+            value = item.get("visits")
+            if date is not None and isinstance(value, (int, float)):
+                rows.append({"month": str(date), "visits": int(value)})
+        return {"source": "Similarweb API", "monthly": rows} if rows else None
+    except Exception as exc:
+        logger.info("Similarweb unavailable: %s", exc)
+        return None
+
+
+# ---------------- Local business checks ----------------
+
+def validate_coordinates(latitude, longitude):
+    if latitude in (None, "") or longitude in (None, ""):
+        return None
+    try:
+        lat = float(latitude)
+        lon = float(longitude)
+    except (TypeError, ValueError):
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    return {"latitude": lat, "longitude": lon}
+
+
+def local_business_report(page, enabled, map_enabled, name, address, latitude, longitude):
+    if not enabled:
+        return None
+
+    coords = validate_coordinates(latitude, longitude) if map_enabled else None
+    issues = []
+    if not name.strip():
+        issues.append("Business name was not provided.")
+    if not address.strip():
+        issues.append("Business address was not provided.")
+    if map_enabled and not coords:
+        issues.append("A valid map location was not provided.")
+
+    return {
+        "enabled": True,
+        "name": name.strip(),
+        "address": address.strip(),
+        "coordinates": coords,
+        "structured_business_detected": page["business_detected"],
+        "issues": issues,
+    }
+
+
+# ---------------- HTML helpers and charts ----------------
+
+def layout(lang, body, title=APP_NAME, extra_head=""):
+    rtl = "rtl" if lang == "ar" else "ltr"
+    language_options = "".join(
+        f'<option value="{k}" {"selected" if k == lang else ""}>{esc(v)}</option>'
+        for k, v in LANGUAGES.items()
     )
-    direction = "rtl" if lang == "ar" else "ltr"
     return f"""<!doctype html>
-<html lang="{esc(lang)}" dir="{direction}">
+<html lang="{esc(lang)}" dir="{rtl}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{esc(title)}</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<title>{esc(title)} - {APP_NAME}</title>
 <style>
-:root{{--bg:#f3f6fb;--surface:#fff;--text:#172033;--muted:#64748b;--border:#e2e8f0;--blue:#2563eb}}
+:root{{--bg:#f4f7fb;--card:#fff;--text:#172337;--muted:#627188;--line:#dce4ef;--blue:#2563eb;--green:#15803d;--red:#b91c1c}}
 *{{box-sizing:border-box}}
-body{{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Arial,sans-serif;line-height:1.6}}
-a{{color:var(--blue);text-decoration:none}}a:hover{{text-decoration:underline}}
-button,input,select{{font:inherit}}
-.topbar{{background:#101b31;color:#fff;padding:14px 20px}}
-.topbar-inner{{max-width:1120px;margin:auto;display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}}
-.logo{{font-size:20px;font-weight:800}}.logo span{{color:#93c5fd}}.tagline{{color:#cbd5e1;font-size:12px}}
-.lang-form{{display:flex;gap:7px;align-items:center}}.lang-form select{{max-width:125px;padding:5px 8px;border-radius:7px;color:#172033;background:white}}
-.wrap{{max-width:1120px;margin:28px auto;padding:0 18px 40px}}
-.hero{{background:linear-gradient(135deg,#172b4d,#1d4ed8);color:#fff;border-radius:20px;padding:28px;margin-bottom:20px;box-shadow:0 10px 35px #14234612}}
-.hero h1{{font-size:clamp(25px,4vw,38px);line-height:1.25;margin:0 0 10px}}.hero p{{color:#dbeafe;overflow-wrap:anywhere}}
-.panel{{background:white;border:1px solid var(--border);border-radius:16px;padding:21px;margin-bottom:18px;box-shadow:0 10px 35px #1423460a}}
-.panel h2{{margin:0 0 14px;font-size:20px}}
-.form-row{{display:flex;gap:10px;align-items:stretch}}
-.url-input,input[type=text],input[type=number]{{min-width:0;border:1px solid #cbd5e1;border-radius:10px;padding:11px;background:white;color:#172033;width:100%}}
-.url-input{{flex:1}}
-.btn{{display:inline-flex;justify-content:center;align-items:center;gap:8px;border:0;border-radius:10px;padding:11px 15px;cursor:pointer;font-weight:700}}
-.btn-primary{{background:#2563eb;color:white}}.btn-light{{background:#edf2f9;color:#172033}}.btn-danger{{background:#fee2e2;color:#991b1b}}
-.small{{font-size:13px;color:var(--muted)}}.grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}}
-.metric-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}}
-.metric{{padding:16px;border:1px solid var(--border);border-radius:13px;background:#fff;color:#172033;min-width:0}}
-.metric strong{{font-size:25px;display:block;color:#172033;line-height:1.4;overflow-wrap:anywhere}}
-.metric span{{display:block;margin-top:5px;font-size:13px;color:#475569;line-height:1.5}}
-.check-list{{display:grid;gap:10px}}.check{{display:flex;gap:12px;align-items:flex-start;padding:13px;border:1px solid var(--border);border-radius:12px;background:white}}
-.check-icon{{flex:none;width:25px;height:25px;border-radius:50%;display:grid;place-items:center;font-size:13px;font-weight:800}}
-.check-ok .check-icon{{background:#dcfce7;color:#166534}}.check-no .check-icon{{background:#fef3c7;color:#92400e}}
-.check h3{{font-size:15px;margin:0 0 3px}}.check p{{font-size:13px;color:var(--muted);margin:0;overflow-wrap:anywhere}}
-.priority{{border-inline-start:4px solid #f59e0b;padding:12px 14px;background:#fffbeb;border-radius:8px;margin:9px 0}}
-.priority.high{{border-color:#dc2626;background:#fef2f2}}.pill{{display:inline-block;border-radius:999px;padding:4px 9px;background:#eef2ff;color:#3730a3;font-size:12px;font-weight:700}}
-.table-wrap{{overflow-x:auto}}table{{border-collapse:collapse;width:100%;font-size:14px}}th,td{{padding:12px;text-align:start;border-bottom:1px solid var(--border);vertical-align:top;overflow-wrap:anywhere}}
-th{{color:var(--muted);font-size:12px}}.business-row{{padding:9px 0;border-bottom:1px solid var(--border);overflow-wrap:anywhere}}
-.notice{{padding:12px 14px;background:#eff6ff;border:1px solid #bfdbfe;color:#1e40af;border-radius:10px;font-size:13px;margin-top:14px}}
-.error{{background:#fef2f2;border:1px solid #fecaca;color:#991b1b;padding:14px;border-radius:12px;margin:15px 0}}
-#map{{height:320px;border-radius:12px;border:1px solid #cbd5e1;margin-top:12px;z-index:1}}
-.location-grid{{display:grid;grid-template-columns:1fr 1fr;gap:10px}}
-.chart-row{{display:grid;grid-template-columns:190px 1fr;gap:22px;align-items:center}}
-.gauge{{width:100%;max-width:190px;display:block;margin:auto}}
-.bar-chart{{display:grid;gap:12px}}.bar-item{{display:grid;grid-template-columns:minmax(90px,140px) 1fr 45px;gap:10px;align-items:center;font-size:13px}}
-.bar-track{{height:13px;border-radius:99px;background:#e2e8f0;overflow:hidden}}
-.bar-fill{{height:100%;border-radius:99px;background:linear-gradient(90deg,#2563eb,#06b6d4)}}
-footer{{max-width:1120px;margin:auto;padding:0 18px 28px;color:var(--muted);font-size:12px}}
-@media(max-width:720px){{.wrap{{margin-top:16px;padding:0 12px 28px}}.hero{{padding:22px 18px}}.panel{{padding:16px}}.grid{{grid-template-columns:1fr}}.metric-grid{{grid-template-columns:1fr 1fr}}.form-row{{flex-direction:column}}.btn{{width:100%}}.chart-row{{grid-template-columns:1fr}}.location-grid{{grid-template-columns:1fr}}.topbar{{padding:12px}}}}
-@media print{{.topbar,.no-print,footer{{display:none!important}}body{{background:white}}.wrap{{margin:0;padding:0}}.panel,.hero{{box-shadow:none;break-inside:avoid}}}}
+body{{margin:0;background:var(--bg);color:var(--text);font-family:Arial,sans-serif;line-height:1.65}}
+header{{background:#10213d;color:#fff;padding:20px 16px}}
+.wrap{{max-width:1120px;margin:auto;padding:18px}}
+.brand{{font-size:23px;font-weight:800}}
+.tagline{{opacity:.85}}
+nav{{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}}
+select,input,button{{font:inherit}}
+select,input[type=text],input[type=url],input[type=number]{{padding:10px;border:1px solid #bdc9da;border-radius:9px;width:100%;background:white;color:#172337}}
+label{{font-weight:600;display:block;margin:9px 0 5px}}
+button,.btn{{display:inline-block;background:var(--blue);color:#fff;border:0;border-radius:9px;padding:10px 15px;text-decoration:none;cursor:pointer;font-weight:700}}
+button.secondary,.btn.secondary{{background:#e7edf6;color:#172337}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:18px;margin:14px 0;box-shadow:0 3px 14px #14294a08}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:13px}}
+.kpi{{font-size:27px;font-weight:800}}
+.muted{{color:var(--muted);font-size:14px}}
+.pill{{display:inline-block;padding:3px 9px;border-radius:20px;background:#e8f7ee;color:var(--green);font-size:13px}}
+.warn{{background:#fff3d8;color:#8a5100}}
+.fail{{background:#fee2e2;color:var(--red)}}
+table{{width:100%;border-collapse:collapse;overflow-wrap:anywhere}}
+th,td{{padding:10px;border-bottom:1px solid var(--line);text-align:start;vertical-align:top}}
+th{{background:#f0f4fa}}
+.chart{{width:100%;max-width:100%;height:auto;display:block}}
+.scorebox{{display:flex;gap:24px;align-items:center;flex-wrap:wrap}}
+.donut{{width:160px;max-width:45vw}}
+.map{{height:340px;border-radius:12px;overflow:hidden;border:1px solid var(--line);margin-top:12px}}
+footer{{text-align:center;color:var(--muted);padding:25px}}
+.actions{{display:flex;gap:8px;flex-wrap:wrap}}
+details{{margin-top:12px}}
+a{{color:#1d4ed8}}
+@media(max-width:600px){{.wrap{{padding:10px}}.card{{padding:13px}}th,td{{padding:7px;font-size:13px}}}}
+@media print{{body{{background:#fff}}header,.no-print,footer{{display:none!important}}.wrap{{max-width:none;padding:0}}.card{{box-shadow:none;break-inside:avoid}}a{{color:#111;text-decoration:none}}}}
 </style>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" defer></script>
-<script src="/app.js" defer></script>
+{extra_head}
 </head>
 <body>
-<header class="topbar"><div class="topbar-inner">
-<div><div class="logo">EAQ <span>SEO Audit</span></div><div class="tagline">{esc(tr(lang,"tagline"))}</div></div>
-<form method="get" action="/" class="lang-form no-print">
-<label for="lang">{esc(tr(lang,"language"))}</label>
-<select id="lang" name="lang">{options}</select>
-</form></div></header>
-<main class="wrap">{content}</main>
-<footer>{esc(tr(lang,"footer"))}</footer>
+<header><div class="wrap"><nav>
+<div><div class="brand">{APP_NAME}</div><div class="tagline">{esc(tr(lang, "tagline"))}</div></div>
+<form method="get" action="/" class="no-print" style="display:flex;gap:8px;align-items:center">
+<label for="lang" style="margin:0">{esc("اللغة" if lang=="ar" else "Language")}</label>
+<select id="lang" name="lang" onchange="this.form.submit()" style="width:auto">{language_options}</select>
+</form>
+</nav></div></header>
+<main class="wrap">{body}</main>
+<footer>{esc(tr(lang, "footer"))}</footer>
 </body></html>"""
 
 
-def history_html(lang):
-    rows = get_history()
-    if not rows:
-        return f'<p class="small">{esc(tr(lang,"no_history"))}</p>'
-    out = ['<div class="table-wrap"><table><thead><tr>']
-    for key in ("date", "website", "score", "actions"):
-        out.append(f"<th>{esc(tr(lang,key))}</th>")
-    out.append("</tr></thead><tbody>")
-    for row in rows:
-        report_link = f"/report/{int(row['id'])}?lang={lang}"
-        out.append(
-            "<tr>"
-            f"<td>{esc(row['created_at'][:19].replace('T',' '))}</td>"
-            f'<td><a href="{report_link}">{esc(row["title"] or row["url"])}</a>'
-            f'<br><span class="small">{esc(row["url"])}</span></td>'
-            f'<td><strong>{int(row["score"])}/100</strong></td>'
-            f'<td><a href="{report_link}">{esc(tr(lang,"view"))}</a> · '
-            f'<form method="post" action="/delete/{int(row["id"])}" style="display:inline">'
-            f'<input type="hidden" name="lang" value="{esc(lang)}">'
-            f'<button class="btn btn-danger" type="submit">{esc(tr(lang,"delete"))}</button></form></td>'
-            "</tr>"
-        )
-    out.append("</tbody></table></div>")
-    return "".join(out)
-
-
-def home_html(lang="en", error=None):
-    error_html = (
-        f'<div class="error"><strong>{esc(tr(lang,error))}</strong>'
-        f'<p>{esc(tr(lang,"error_detail"))}</p></div>' if error else ""
-    )
-    content = f"""
-<section class="hero"><h1>{esc(tr(lang,"heading"))}</h1><p>{esc(tr(lang,"intro"))}</p></section>
-<section class="panel">
-<h2>{esc(tr(lang,"audit"))}</h2>
-<form method="post" action="/audit">
-<input type="hidden" name="lang" value="{esc(lang)}">
-<label for="url"><strong>{esc(tr(lang,"url"))}</strong></label>
-<div class="form-row" style="margin-top:9px">
-<input class="url-input" type="text" id="url" name="url" maxlength="{MAX_URL_LENGTH}"
-placeholder="https://example.com" autocomplete="url" inputmode="url">
-<button class="btn btn-primary" type="submit">{esc(tr(lang,"audit"))}</button>
-</div>
-<hr style="border:0;border-top:1px solid #e2e8f0;margin:22px 0">
-<h2>{esc(tr(lang,"business"))}</h2>
-<div class="location-grid">
-<div><label for="business_name">{esc(tr(lang,"business_name"))}</label>
-<input id="business_name" name="business_name" type="text" maxlength="200"></div>
-<div><label for="business_address">{esc(tr(lang,"address"))}</label>
-<input id="business_address" name="business_address" type="text" maxlength="300"></div>
-<div><label for="latitude">{esc(tr(lang,"latitude"))}</label>
-<input id="latitude" name="latitude" type="number" step="any" min="-90" max="90" placeholder="36.19"></div>
-<div><label for="longitude">{esc(tr(lang,"longitude"))}</label>
-<input id="longitude" name="longitude" type="number" step="any" min="-180" max="180" placeholder="6.15"></div>
-</div>
-<p class="small">{esc(tr(lang,"map_help"))}</p>
-<div id="map" aria-label="Interactive location map"></div>
-{error_html}
-<div class="notice">{esc(tr(lang,"privacy"))}</div>
-</form></section>
-<section class="panel"><h2>{esc(tr(lang,"history"))}</h2>{history_html(lang)}</section>
-"""
-    return page_shell(content, lang, APP_NAME)
-
-
-def gauge_svg(score):
-    color = "#16a34a" if score >= 80 else "#f59e0b" if score >= 50 else "#dc2626"
-    # A half-circle gauge, with a score arc.
-    circumference = 267.0
-    length = circumference * max(0, min(100, score)) / 100
+def donut_svg(score, passed, total, size=160):
+    score = max(0, min(100, int(score)))
+    circumference = 2 * 3.141592653589793 * 43
+    dash = circumference * score / 100
+    color = "#16a34a" if score >= 80 else ("#d97706" if score >= 55 else "#dc2626")
     return f"""
-<svg class="gauge" viewBox="0 0 220 140" role="img" aria-label="SEO score {score} out of 100">
-<path d="M25 115 A85 85 0 0 1 195 115" fill="none" stroke="#e2e8f0" stroke-width="17" stroke-linecap="round"/>
-<path d="M25 115 A85 85 0 0 1 195 115" fill="none" stroke="{color}" stroke-width="17"
-stroke-linecap="round" pathLength="100" stroke-dasharray="{score} 100"/>
-<text x="110" y="96" text-anchor="middle" font-size="33" font-weight="800" fill="#172033">{score}</text>
-<text x="110" y="119" text-anchor="middle" font-size="11" fill="#64748b">/ 100</text>
+<svg class="donut" viewBox="0 0 120 120" role="img" aria-label="SEO score {score}">
+<circle cx="60" cy="60" r="43" fill="none" stroke="#e5eaf2" stroke-width="11"/>
+<circle cx="60" cy="60" r="43" fill="none" stroke="{color}" stroke-width="11"
+stroke-linecap="round" stroke-dasharray="{dash:.2f} {circumference:.2f}"
+transform="rotate(-90 60 60)"/>
+<text x="60" y="56" text-anchor="middle" font-size="25" font-weight="800" fill="currentColor">{score}</text>
+<text x="60" y="74" text-anchor="middle" font-size="10" fill="currentColor">/ 100</text>
 </svg>"""
 
 
-def render_report(report, lang="en"):
-    checks = []
-    for item in report.get("checks", []):
-        key = item["key"]
-        state = tr(lang, "good") if item["ok"] else tr(lang, "warning")
-        checks.append(
-            f'<article class="check {"check-ok" if item["ok"] else "check-no"}">'
-            f'<div class="check-icon">{"✓" if item["ok"] else "!"}</div>'
-            f'<div><h3>{esc(tr(lang,key))}</h3>'
-            f'<p>{esc(state)} · {esc(item.get("details",""))}</p></div></article>'
-        )
+def line_chart_svg(items, xkey, ykey, title, color="#2563eb"):
+    if not items:
+        return '<p class="muted">No chart data available.</p>'
 
-    priorities = []
-    for item in report.get("priorities", []):
-        level = item.get("priority", "medium")
-        priorities.append(
-            f'<div class="priority {esc(level)}"><span class="pill">{esc(tr(lang,level))}</span> '
-            f'<strong>{esc(tr(lang,item["key"]))}</strong>'
-            f'<div class="small">{esc(item.get("details",""))}</div></div>'
-        )
+    values = []
+    for item in items:
+        try:
+            values.append(float(item[ykey]))
+        except (ValueError, TypeError, KeyError):
+            values.append(0.0)
 
-    score = int(report.get("score", 0))
-    passed = int(report.get("passed", 0))
-    total = int(report.get("total", 0))
-    pagespeed = report.get("pagespeed", {})
-    if pagespeed.get("available"):
-        bars = []
-        for name, value in pagespeed.get("scores", {}).items():
-            bars.append(
-                f'<div class="bar-item"><span>{esc(name.replace("-"," ").title())}</span>'
-                f'<div class="bar-track"><div class="bar-fill" style="width:{max(0,min(100,int(value)))}%"></div></div>'
-                f'<strong>{int(value)}/100</strong></div>'
-            )
-        speed_html = '<div class="bar-chart">' + "".join(bars) + "</div>"
-        if pagespeed.get("lab"):
-            speed_html += "<h3>Lighthouse lab measurements</h3><table>"
-            for key, value in pagespeed["lab"].items():
-                speed_html += f"<tr><th>{esc(key)}</th><td>{esc(value)}</td></tr>"
-            speed_html += "</table>"
-    else:
-        speed_html = f'<p class="small">{esc(tr(lang,"no_speed"))}</p>'
+    width, height = 760, 270
+    left, right, top, bottom = 58, 20, 28, 55
+    plot_w, plot_h = width-left-right, height-top-bottom
+    max_v = max(values) if values else 1
+    if max_v <= 0:
+        max_v = 1
+    min_v = min(0, min(values))
+    span = max_v - min_v
+    if span <= 0:
+        span = 1
 
-    robots = report.get("robots_sitemap", {})
-    robots_data = robots.get("robots", {})
-    sitemap_html = (
-        f'<p><strong>robots.txt:</strong> HTTP {esc(robots_data.get("status") or "Unavailable")}</p>'
+    points = []
+    labels = []
+    for i, (item, value) in enumerate(zip(items, values)):
+        x = left + (plot_w * i / max(1, len(items)-1))
+        y = top + plot_h - ((value-min_v)/span)*plot_h
+        points.append((x, y))
+        label = str(item.get(xkey, ""))[:10]
+        labels.append(f'<text x="{x:.1f}" y="{height-25}" font-size="11" text-anchor="middle" fill="currentColor">{esc(label)}</text>')
+
+    polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+    circles = "".join(
+        f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="{color}"><title>{esc(items[i].get(xkey,""))}: {values[i]:,.0f}</title></circle>'
+        for i, (x, y) in enumerate(points)
     )
-    sitemap_html += "<div class='table-wrap'><table><tr><th>URL</th><th>HTTP</th><th>Result</th></tr>"
-    for item in robots.get("sitemaps", []):
-        sitemap_html += (
-            f'<tr><td>{esc(item["url"])}</td><td>{esc(item.get("status") or "—")}</td>'
-            f'<td>{"Found" if item.get("ok") else "Not verified"}</td></tr>'
+    grid = []
+    for i in range(5):
+        y = top + plot_h * i / 4
+        value = max_v - (max_v-min_v)*i/4
+        grid.append(
+            f'<line x1="{left}" y1="{y:.1f}" x2="{width-right}" y2="{y:.1f}" stroke="#dfe6f0"/>'
+            f'<text x="{left-8}" y="{y+4:.1f}" font-size="10" text-anchor="end" fill="currentColor">{value:,.0f}</text>'
         )
-    sitemap_html += "</table></div>"
 
-    link_html = (
-        '<p class="small">Only a limited sample is checked. Some servers block automated link checks.</p>'
-        '<div class="table-wrap"><table><tr><th>URL</th><th>HTTP</th><th>Result</th></tr>'
-    )
-    for item in report.get("link_results", []):
-        link_html += (
-            f'<tr><td>{esc(item["url"])}</td><td>{esc(item.get("status") or "—")}</td>'
-            f'<td>{esc(item["state"])}</td></tr>'
-        )
-    link_html += "</table></div>"
-
-    business = report.get("business", {})
-    business_rows = ""
-    for key, value in business.items():
-        if value:
-            business_rows += f'<div class="business-row"><strong>{esc(key)}:</strong> {esc(value)}</div>'
-    if not business_rows:
-        business_rows = f'<p class="small">{esc(tr(lang,"no_business"))}</p>'
-
-    location = report.get("location", {})
-    if location.get("latitude") not in ("", None) and location.get("longitude") not in ("", None):
-        lat, lon = float(location["latitude"]), float(location["longitude"])
-        map_html = (
-            f'<p>{esc(location.get("address") or "")}</p>'
-            f'<p class="small">{esc(tr(lang,"latitude"))}: {lat}, {esc(tr(lang,"longitude"))}: {lon}</p>'
-            f'<p><a href="https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=15/{lat}/{lon}" target="_blank" rel="noopener">Open location in OpenStreetMap</a></p>'
-            f'<iframe title="Business location" width="100%" height="300" style="border:0;border-radius:12px" loading="lazy" '
-            f'src="https://www.openstreetmap.org/export/embed.html?bbox={lon-0.02}%2C{lat-0.02}%2C{lon+0.02}%2C{lat+0.02}&layer=mapnik&marker={lat}%2C{lon}"></iframe>'
-        )
-    else:
-        map_html = f'<p class="small">{esc(tr(lang,"no_location"))}</p>'
-
-    content = f"""
-<section class="hero">
-<div class="no-print" style="margin-bottom:12px"><a href="/?lang={lang}" style="color:#dbeafe">← {esc(tr(lang,"back"))}</a></div>
-<h1>{esc(tr(lang,"results"))}</h1><p>{esc(report["url"])}</p>
-<div class="chart-row" style="margin-top:20px">
-<div>{gauge_svg(score)}<p style="text-align:center">{esc(tr(lang,"score_chart"))}</p></div>
-<div class="metric-grid">
-<div class="metric"><strong>{score}/100</strong><span>{esc(tr(lang,"overall"))}</span></div>
-<div class="metric"><strong>{passed}/{total}</strong><span>{esc(tr(lang,"passed"))}</span></div>
-<div class="metric"><strong>{len(report.get("priorities",[]))}</strong><span>{esc(tr(lang,"issues"))}</span></div>
-</div></div>
-<p style="font-size:13px">{esc(tr(lang,"not_rank"))}</p>
-</section>
-<div class="no-print" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px">
-<button class="btn btn-primary" id="print-report" type="button">{esc(tr(lang,"print"))}</button>
-<a class="btn btn-light" href="/?lang={lang}">{esc(tr(lang,"back"))}</a></div>
-<section class="panel"><h2>{esc(tr(lang,"speed"))}</h2>{speed_html}</section>
-<section class="panel"><h2>{esc(tr(lang,"sitemap"))}</h2>{sitemap_html}</section>
-<section class="panel"><h2>{esc(tr(lang,"link_check"))}</h2>{link_html}</section>
-<section class="panel"><h2>{esc(tr(lang,"priorities"))}</h2>{"".join(priorities) or "<p>No checklist priorities detected.</p>"}</section>
-<section class="panel"><h2>{esc(tr(lang,"details"))}</h2><div class="check-list">{"".join(checks)}</div></section>
-<section class="panel"><h2>{esc(tr(lang,"business"))}</h2>{business_rows}</section>
-<section class="panel"><h2>{esc(tr(lang,"location"))}</h2>{map_html}</section>
-<section class="panel"><h2>{esc(tr(lang,"security"))}</h2>
-<p class="small">{esc(tr(lang,"privacy"))}</p>
-<p class="small">{esc(tr(lang,"pdf_tip"))}</p><p class="small">{esc(tr(lang,"saved"))}</p>
-<p class="small">{esc(tr(lang,"report_id"))}: {esc(report.get("report_id","—"))}</p></section>
-"""
-    return page_shell(content, lang, f'{tr(lang,"results")} — {report.get("title") or report["url"]}')
+    return f"""
+<div class="card">
+<h3>{esc(title)}</h3>
+<svg class="chart" viewBox="0 0 {width} {height}" role="img" aria-label="{esc(title)}">
+{''.join(grid)}
+<polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+{circles}
+{''.join(labels)}
+</svg>
+</div>"""
 
 
-# ---------------- Browser JavaScript ----------------
-
-APP_JS = r"""
-"use strict";
-document.addEventListener("DOMContentLoaded", function () {
-  const langSelect = document.getElementById("lang");
-  if (langSelect) {
-    langSelect.addEventListener("change", function () {
-      this.form.submit();
-    });
-  }
-
-  const printButton = document.getElementById("print-report");
-  if (printButton) {
-    printButton.addEventListener("click", function () {
-      window.print();
-    });
-  }
-
-  const mapElement = document.getElementById("map");
-  if (mapElement && window.L) {
-    const latInput = document.getElementById("latitude");
-    const lonInput = document.getElementById("longitude");
-    const defaultLat = 36.19;
-    const defaultLon = 6.15;
-    const initialLat = parseFloat(latInput.value) || defaultLat;
-    const initialLon = parseFloat(lonInput.value) || defaultLon;
-    const map = L.map("map").setView([initialLat, initialLon], 6);
-
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 19,
-      attribution: '&copy; OpenStreetMap contributors'
-    }).addTo(map);
-
-    let marker = L.marker([initialLat, initialLon]).addTo(map);
-
-    function setLocation(lat, lon) {
-      latInput.value = Number(lat).toFixed(6);
-      lonInput.value = Number(lon).toFixed(6);
-      marker.setLatLng([lat, lon]);
-    }
-
-    map.on("click", function (event) {
-      setLocation(event.latlng.lat, event.latlng.lng);
-    });
-
-    latInput.addEventListener("change", function () {
-      const lat = parseFloat(latInput.value);
-      const lon = parseFloat(lonInput.value);
-      if (Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
-        setLocation(lat, lon);
-        map.setView([lat, lon], 13);
-      }
-    });
-    lonInput.addEventListener("change", function () {
-      const lat = parseFloat(latInput.value);
-      const lon = parseFloat(lonInput.value);
-      if (Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
-        setLocation(lat, lon);
-        map.setView([lat, lon], 13);
-      }
-    });
-    setTimeout(function () { map.invalidateSize(); }, 300);
-  }
-});
-"""
+def pie_svg(passed, failed):
+    total = max(1, passed + failed)
+    pct = 100 * passed / total
+    c = 2 * 3.141592653589793 * 42
+    dash = c * pct / 100
+    return f"""
+<svg class="donut" viewBox="0 0 120 120" role="img" aria-label="Passed and failed checks">
+<circle cx="60" cy="60" r="42" fill="none" stroke="#fee2e2" stroke-width="14"/>
+<circle cx="60" cy="60" r="42" fill="none" stroke="#16a34a" stroke-width="14"
+stroke-dasharray="{dash:.2f} {c:.2f}" transform="rotate(-90 60 60)"/>
+<text x="60" y="56" font-size="22" font-weight="800" text-anchor="middle" fill="currentColor">{passed}</text>
+<text x="60" y="72" font-size="10" text-anchor="middle" fill="currentColor">/{total}</text>
+</svg>"""
 
 
-@app.get("/app.js")
-def app_js():
-    return Response(APP_JS, media_type="application/javascript", headers={"Cache-Control": "no-cache"})
+def render_table(rows, columns):
+    if not rows:
+        return '<p class="muted">No data available.</p>'
+    head = "".join(f"<th>{esc(label)}</th>" for _, label in columns)
+    body = []
+    for row in rows:
+        cells = "".join(f"<td>{esc(row.get(key, ''))}</td>" for key, _ in columns)
+        body.append(f"<tr>{cells}</tr>")
+    return f"<div style='overflow-x:auto'><table><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></div>"
 
 
-# ---------------- Routes ----------------
+# ---------------- Pages ----------------
 
 @app.get("/", response_class=HTMLResponse)
-def home(request: Request, lang: str = "en"):
-    if lang not in LANGUAGES:
-        lang = "en"
-    return HTMLResponse(home_html(lang))
+def home(lang: str = "ar"):
+    lang = lang if lang in LANGUAGES else "ar"
+    body = f"""
+<section class="card">
+<h1>{esc(tr(lang, "heading"))}</h1>
+<p>{esc(tr(lang, "intro"))}</p>
+<form method="post" action="/audit">
+<input type="hidden" name="lang" value="{esc(lang)}">
+<label for="url">{esc(tr(lang, "url"))}</label>
+<input id="url" name="url" type="url" placeholder="https://example.com" required maxlength="{MAX_URL_LENGTH}">
+<p class="muted">{esc(tr(lang, "privacy"))}</p>
+
+<div class="card">
+<label style="display:flex;gap:10px;align-items:center">
+<input type="checkbox" name="local_enabled" value="yes" id="local_enabled" style="width:auto">
+<span>{esc(tr(lang, "business_enable"))}</span>
+</label>
+<p class="muted">{esc(tr(lang, "local_note"))}</p>
+
+<div id="local_fields" hidden>
+<label for="business_name">{esc(tr(lang, "business_name"))}</label>
+<input id="business_name" name="business_name" type="text" maxlength="200">
+
+<label for="address">{esc(tr(lang, "address"))}</label>
+<input id="address" name="address" type="text" maxlength="300">
+
+<label style="display:flex;gap:10px;align-items:center">
+<input type="checkbox" name="map_enabled" value="yes" id="map_enabled" style="width:auto">
+<span>{esc(tr(lang, "map_enable"))}</span>
+</label>
+
+<div id="map_fields" hidden>
+<div class="grid">
+<div><label for="latitude">{esc(tr(lang, "latitude"))}</label>
+<input id="latitude" name="latitude" type="number" step="any" min="-90" max="90" placeholder="24.7136"></div>
+<div><label for="longitude">{esc(tr(lang, "longitude"))}</label>
+<input id="longitude" name="longitude" type="number" step="any" min="-180" max="180" placeholder="46.6753"></div>
+</div>
+<p class="muted">{esc(tr(lang, "map_help"))}</p>
+<div id="map" class="map"></div>
+</div>
+</div>
+</div>
+
+<button type="submit">{esc(tr(lang, "audit"))}</button>
+</form>
+</section>
+
+<section class="card">
+<h2>{esc(tr(lang, "history_reports"))}</h2>
+{render_history(lang)}
+</section>
+
+<script>
+const localCheck = document.getElementById('local_enabled');
+const mapCheck = document.getElementById('map_enabled');
+const localFields = document.getElementById('local_fields');
+const mapFields = document.getElementById('map_fields');
+let mapInstance = null;
+let mapMarker = null;
+
+function syncLocal() {{
+  localFields.hidden = !localCheck.checked;
+  if (!localCheck.checked) {{
+    mapCheck.checked = false;
+    mapFields.hidden = true;
+  }}
+}}
+function syncMap() {{
+  mapFields.hidden = !mapCheck.checked || !localCheck.checked;
+  if (!mapFields.hidden) {{
+    loadMap();
+  }}
+}}
+localCheck.addEventListener('change', syncLocal);
+localCheck.addEventListener('change', syncMap);
+mapCheck.addEventListener('change', syncMap);
+
+function loadMap() {{
+  if (mapInstance) {{
+    setTimeout(() => mapInstance.invalidateSize(), 150);
+    return;
+  }}
+  if (!window.L) {{
+    const css = document.createElement('link');
+    css.rel = 'stylesheet';
+    css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+    document.head.appendChild(css);
+    const script = document.createElement('script');
+    script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+    script.onload = initMap;
+    document.head.appendChild(script);
+  }} else {{
+    initMap();
+  }}
+}}
+function initMap() {{
+  if (mapInstance || !window.L) return;
+  mapInstance = L.map('map').setView([24.7136, 46.6753], 5);
+  L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors'
+  }}).addTo(mapInstance);
+  mapInstance.on('click', function(e) {{
+    document.getElementById('latitude').value = e.latlng.lat.toFixed(6);
+    document.getElementById('longitude').value = e.latlng.lng.toFixed(6);
+    if (mapMarker) mapMarker.setLatLng(e.latlng);
+    else mapMarker = L.marker(e.latlng).addTo(mapInstance);
+  }});
+  setTimeout(() => mapInstance.invalidateSize(), 200);
+}}
+</script>
+"""
+    return HTMLResponse(layout(lang, body, APP_NAME))
+
+
+def render_history(lang):
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT id,url,title,score,created_at FROM reports ORDER BY id DESC LIMIT 20"
+        ).fetchall()
+
+    if not rows:
+        return f"<p>{esc(tr(lang, 'no_reports'))}</p>"
+
+    result = ["<div style='overflow-x:auto'><table><thead><tr>"]
+    for key in ("date", "website", "score", "actions"):
+        result.append(f"<th>{esc(tr(lang, key))}</th>")
+    result.append("</tr></thead><tbody>")
+
+    for row in rows:
+        result.append(
+            "<tr>"
+            f"<td>{esc(row['created_at'][:19].replace('T',' '))}</td>"
+            f"<td>{esc(row['url'])}</td>"
+            f"<td>{int(row['score'])}/100</td>"
+            "<td class='actions'>"
+            f"<a class='btn secondary' href='/report/{int(row['id'])}?lang={esc(lang)}'>{esc(tr(lang,'view'))}</a>"
+            f"<form method='post' action='/delete/{int(row['id'])}' onsubmit=\"return confirm('Delete report?')\">"
+            f"<input type='hidden' name='lang' value='{esc(lang)}'>"
+            f"<button class='secondary' type='submit'>{esc(tr(lang,'delete'))}</button>"
+            "</form></td></tr>"
+        )
+    result.append("</tbody></table></div>")
+    return "".join(result)
 
 
 @app.post("/audit", response_class=HTMLResponse)
 def audit(
-    url: str = Form(""),
-    lang: str = Form("en"),
+    url: str = Form(...),
+    lang: str = Form("ar"),
+    local_enabled: str = Form(""),
+    map_enabled: str = Form(""),
     business_name: str = Form(""),
-    business_address: str = Form(""),
+    address: str = Form(""),
     latitude: str = Form(""),
     longitude: str = Form(""),
 ):
-    if lang not in LANGUAGES:
-        lang = "en"
+    lang = lang if lang in LANGUAGES else "ar"
+
     try:
         clean_url = validate_public_url(url)
-    except ValueError:
-        return HTMLResponse(home_html(lang, "invalid"), status_code=400)
+        page = analyze_page(clean_url)
+    except Exception as exc:
+        logger.info("Audit failed: %s", exc)
+        body = f"""
+<div class="card">
+<h1>{esc(tr(lang, "error"))}</h1>
+<p>{esc(tr(lang, "invalid"))}</p>
+<p class="muted">{esc(tr(lang, "error"))}</p>
+<a class="btn" href="/?lang={esc(lang)}">{esc(tr(lang, "new"))}</a>
+</div>"""
+        return HTMLResponse(layout(lang, body), status_code=400)
 
-    try:
-        fetched = fetch_page(clean_url)
-        report = audit_html(fetched["url"], fetched["html"], fetched["status"])
-        report["business"] = report.get("business", {})
-        if business_name.strip():
-            report["business"]["Name"] = business_name.strip()[:200]
-        if business_address.strip():
-            report["business"]["Address"] = business_address.strip()[:300]
+    link_results = []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [pool.submit(check_one_link, link) for link in page["links"]]
+        for future in as_completed(futures):
+            try:
+                link_results.append(future.result())
+            except Exception:
+                pass
+    link_results.sort(key=lambda x: x["url"])
 
-        loc = {"address": business_address.strip()[:300]}
-        try:
-            lat = float(latitude) if latitude.strip() else None
-            lon = float(longitude) if longitude.strip() else None
-        except ValueError:
-            lat, lon = None, None
-        if lat is not None and lon is not None and -90 <= lat <= 90 and -180 <= lon <= 180:
-            loc["latitude"] = lat
-            loc["longitude"] = lon
-        report["location"] = loc
+    robots = check_robots_sitemap(page["final_url"])
+    speed = pagespeed_data(page["final_url"])
+    domain = get_domain_age(page["final_url"])
+    archive = get_wayback_history(page["final_url"])
+    traffic = get_similarweb_data(page["final_url"])
 
-        report = run_external_checks(fetched["url"], report)
-        save_report(report)
-        return HTMLResponse(render_report(report, lang))
-    except (requests.RequestException, ValueError, OSError) as exc:
-        logger.info("Audit failed: %s", type(exc).__name__)
-        return HTMLResponse(home_html(lang, "error"), status_code=400)
-    except Exception:
-        logger.exception("Unexpected audit error")
-        return HTMLResponse(home_html(lang, "error"), status_code=500)
+    local = local_business_report(
+        page=page,
+        enabled=(local_enabled == "yes"),
+        map_enabled=(map_enabled == "yes"),
+        name=business_name,
+        address=address,
+        latitude=latitude,
+        longitude=longitude,
+    )
+
+    report = {
+        "url": clean_url,
+        "final_url": page["final_url"],
+        "http_status": page["http_status"],
+        "title": page["title"],
+        "description": page["description"],
+        "canonical": page["canonical"],
+        "score": page["score"],
+        "passed": page["passed"],
+        "total_checks": page["total_checks"],
+        "checks": page["checks"],
+        "links": link_results,
+        "robots_sitemap": robots,
+        "pagespeed": speed,
+        "domain": domain,
+        "archive": archive,
+        "traffic": traffic,
+        "local": local,
+        "created_at": now_iso(),
+    }
+
+    with get_db() as db:
+        cursor = db.execute(
+            "INSERT INTO reports(url,title,score,report_json,created_at) VALUES(?,?,?,?,?)",
+            (
+                clean_url,
+                page["title"],
+                page["score"],
+                json.dumps(report, ensure_ascii=False),
+                now_iso(),
+            ),
+        )
+        report_id = cursor.lastrowid
+        db.commit()
+
+    return RedirectResponse(
+        url=f"/report/{report_id}?lang={lang}",
+        status_code=303,
+    )
 
 
 @app.get("/report/{report_id}", response_class=HTMLResponse)
-def report_page(report_id: int, lang: str = "en"):
-    if lang not in LANGUAGES:
-        lang = "en"
-    report = get_report(report_id)
-    if not report:
-        return HTMLResponse(home_html(lang, "error"), status_code=404)
-    return HTMLResponse(render_report(report, lang))
+def view_report(report_id: int, lang: str = "ar"):
+    lang = lang if lang in LANGUAGES else "ar"
+    with get_db() as db:
+        row = db.execute(
+            "SELECT report_json FROM reports WHERE id=?",
+            (report_id,),
+        ).fetchone()
+
+    if not row:
+        return HTMLResponse(
+            layout(lang, f"<div class='card'><h1>Report not found</h1><a href='/?lang={esc(lang)}'>{esc(tr(lang,'new'))}</a></div>"),
+            status_code=404,
+        )
+
+    report = json.loads(row["report_json"])
+    score = int(report.get("score", 0))
+    passed = int(report.get("passed", 0))
+    total = int(report.get("total_checks", 0))
+    failed = max(0, total - passed)
+    domain = report.get("domain") or {}
+    archive = report.get("archive") or []
+    traffic = report.get("traffic")
+    speed = report.get("pagespeed")
+    local = report.get("local")
+
+    checks_html = []
+    for check in report.get("checks", []):
+        status = "pill" if check["passed"] else "pill fail"
+        symbol = "✓" if check["passed"] else "!"
+        checks_html.append(
+            f"<tr><td><span class='{status}'>{symbol}</span></td>"
+            f"<td><strong>{esc(check['label'])}</strong></td>"
+            f"<td>{esc(check['detail'])}</td></tr>"
+        )
+
+    robots = report.get("robots_sitemap") or {}
+    robots_rows = []
+    for key in ("robots", "sitemap"):
+        item = robots.get(key) or {}
+        robots_rows.append({
+            "type": key,
+            "url": item.get("url", ""),
+            "status": item.get("status", "Unknown"),
+            "result": "Found" if item.get("status", 0) == 200 else "Review",
+        })
+
+    link_html = render_table(
+        report.get("links", []),
+        [("url", "URL"), ("status", "HTTP"), ("result", "Result")],
+    )
+
+    domain_age = domain.get("age_years")
+    age_text = (
+        f"{domain_age} {esc(tr(lang,'years'))}"
+        if domain_age is not None
+        else esc(tr(lang, "unknown"))
+    )
+
+    domain_card = f"""
+<div class="card">
+<h2>{esc(tr(lang,'domain_age'))}</h2>
+<div class="grid">
+<div><div class="muted">{esc(tr(lang,'domain_age'))}</div><div class="kpi">{age_text}</div></div>
+<div><div class="muted">{esc(tr(lang,'created'))}</div><div class="kpi" style="font-size:19px">{esc(domain.get('created') or tr(lang,'unknown'))}</div></div>
+</div>
+<p class="muted">{esc(tr(lang,'source'))}: RDAP. Domain registration age may differ from the age of the website itself.</p>
+</div>"""
+
+    archive_chart = ""
+    if archive:
+        archive_chart = line_chart_svg(
+            archive, "year", "count", tr(lang, "archive"), "#7c3aed"
+        )
+        archive_table = render_table(
+            archive, [("year", "Year"), ("count", "Archived snapshots")]
+        )
+    else:
+        archive_chart = f"<div class='card'><h2>{esc(tr(lang,'history'))}</h2><p>{esc(tr(lang,'no_archive'))}</p></div>"
+        archive_table = ""
+
+    traffic_section = ""
+    if traffic and traffic.get("monthly"):
+        traffic_section = line_chart_svg(
+            traffic["monthly"], "month", "visits", tr(lang, "visits"), "#0891b2"
+        )
+        traffic_section += f"<p class='muted'>{esc(tr(lang,'source'))}: {esc(traffic.get('source','External provider'))}. These are estimates, not verified analytics.</p>"
+        traffic_section += render_table(
+            traffic["monthly"],
+            [("month", "Month"), ("visits", "Estimated visits")],
+        )
+    else:
+        traffic_section = (
+            f"<div class='card'><h2>{esc(tr(lang,'visits'))}</h2>"
+            f"<p>{esc(tr(lang,'no_visits'))}</p>"
+            "<p class='muted'>To enable traffic estimates, configure SIMILARWEB_API_KEY in the server environment. Availability depends on the provider and subscription.</p></div>"
+        )
+
+    speed_section = ""
+    if speed:
+        speed_rows = [{"metric": k.title(), "score": v} for k, v in speed.items()]
+        speed_section = (
+            f"<div class='card'><h2>{esc(tr(lang,'speed'))}</h2>"
+            + render_table(speed_rows, [("metric", "Metric"), ("score", "Score / 100")])
+            + "</div>"
+        )
+        speed_chart_items = [{"metric": k.title(), "score": v} for k, v in speed.items()]
+        speed_section += line_chart_svg(speed_chart_items, "metric", "score", tr(lang, "speed"), "#0f766e")
+    else:
+        speed_section = f"<div class='card'><h2>{esc(tr(lang,'speed'))}</h2><p>{esc(tr(lang,'speed_none'))}</p></div>"
+
+    local_section = ""
+    if local:
+        coords = local.get("coordinates")
+        coord_text = (
+            f"{coords['latitude']}, {coords['longitude']}"
+            if coords else tr(lang, "no_location")
+        )
+        map_html = ""
+        if coords:
+            lat = coords["latitude"]
+            lon = coords["longitude"]
+            map_html = f"""
+<div class="card">
+<h3>{esc(tr(lang,'business'))}</h3>
+<p><strong>{esc(local.get('name') or tr(lang,'unknown'))}</strong></p>
+<p>{esc(local.get('address') or tr(lang,'unknown'))}</p>
+<p>{esc(coord_text)}</p>
+<p><a href="https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=14/{lat}/{lon}" target="_blank" rel="noopener noreferrer">Open location in OpenStreetMap</a></p>
+</div>"""
+        else:
+            map_html = f"<div class='card'><h3>{esc(tr(lang,'business'))}</h3><p>{esc(local.get('name') or tr(lang,'unknown'))}</p><p>{esc(local.get('address') or tr(lang,'unknown'))}</p><p>{esc(tr(lang,'no_location'))}</p></div>"
+
+        local_issues = "".join(f"<li>{esc(x)}</li>" for x in local.get("issues", []))
+        local_section = f"""
+<div class="card">
+<h2>{esc(tr(lang,'local_result'))}</h2>
+<p>{esc(tr(lang,'business'))}: {esc(local.get('name') or tr(lang,'unknown'))}</p>
+<p>{esc(tr(lang,'address'))}: {esc(local.get('address') or tr(lang,'unknown'))}</p>
+<p>Structured local business data: {"Detected" if local.get('structured_business_detected') else esc(tr(lang,'no_business'))}</p>
+<ul>{local_issues}</ul>
+</div>{map_html}"""
+
+    score_cards = f"""
+<div class="card">
+<div class="scorebox">
+{donut_svg(score, passed, total)}
+<div>
+<h1>{esc(tr(lang,'report'))}</h1>
+<div class="kpi">{score}/100</div>
+<p>{esc(tr(lang,'not_rank'))}</p>
+<p><span class="pill">{passed} {esc(tr(lang,'passed'))}</span>
+<span class="pill warn">{failed} {esc(tr(lang,'issues'))}</span></p>
+<p><a href="{esc(report.get('final_url',''))}" target="_blank" rel="noopener noreferrer">{esc(report.get('final_url',''))}</a></p>
+<p class="muted">{esc(tr(lang,'report_id'))}: {report_id} · {esc(report.get('created_at','')[:19])}</p>
+</div>
+</div>
+<hr style="border:0;border-top:1px solid #dce4ef;margin:18px 0">
+<div class="grid">
+<div><h3>{esc(tr(lang,'score'))}</h3>{donut_svg(score, passed, total)}</div>
+<div><h3>Check distribution</h3>{pie_svg(passed, failed)}</div>
+</div>
+</div>"""
+
+    body = f"""
+<div class="actions no-print">
+<a class="btn secondary" href="/?lang={esc(lang)}">{esc(tr(lang,'new'))}</a>
+<button onclick="window.print()">{esc(tr(lang,'print'))}</button>
+</div>
+{score_cards}
+{domain_card}
+{archive_chart}
+{archive_table}
+{traffic_section}
+{speed_section}
+
+<div class="card">
+<h2>{esc(tr(lang,'sitemap'))}</h2>
+{render_table(robots_rows, [('type','Type'),('url','URL'),('status','HTTP'),('result','Result')])}
+</div>
+
+<div class="card">
+<h2>{esc(tr(lang,'links'))}</h2>
+<p class="muted">{esc(tr(lang,'sample'))}</p>
+{link_html}
+</div>
+
+<div class="card">
+<h2>{esc(tr(lang,'details'))}</h2>
+{pie_svg(passed, failed)}
+<div style="overflow-x:auto"><table><thead><tr><th></th><th>Check</th><th>Finding</th></tr></thead>
+<tbody>{''.join(checks_html)}</tbody></table></div>
+</div>
+
+{local_section}
+
+<div class="card">
+<h2>{esc(tr(lang,'security'))}</h2>
+<p>{esc(tr(lang,'privacy'))}</p>
+<p class="muted">{esc(tr(lang,'saved'))}</p>
+</div>
+"""
+    return HTMLResponse(layout(lang, body, f"{APP_NAME} Report #{report_id}"))
 
 
-@app.post("/delete/{report_id}", response_class=HTMLResponse)
-def delete_report(report_id: int, lang: str = Form("en")):
-    if lang not in LANGUAGES:
-        lang = "en"
+@app.post("/delete/{report_id}")
+def delete_report(report_id: int, lang: str = Form("ar")):
+    lang = lang if lang in LANGUAGES else "ar"
     with get_db() as db:
         db.execute("DELETE FROM reports WHERE id=?", (report_id,))
         db.commit()
-    return HTMLResponse(home_html(lang))
+    return RedirectResponse(url=f"/?lang={lang}", status_code=303)
 
 
 @app.get("/health")
 def health():
-    return JSONResponse({"status": "ok", "app": APP_NAME, "version": APP_VERSION})
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+    return {"status": "ok", "app": APP_NAME, "version": APP_VERSION}
