@@ -1,1286 +1,1579 @@
+
 import os
 import re
 import json
 import time
 import socket
-import sqlite3
 import ipaddress
-import logging
+import sqlite3
+import requests
+
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urljoin, urlencode
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse, urljoin
+from xml.etree import ElementTree
 from html import escape
 
-import requests
+from fastapi import FastAPI, Form, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+
+
+# ============================================================
+# EAQ SEO AUDIT
+# ============================================================
 
 APP_NAME = "EAQ SEO Audit"
-APP_VERSION = "4.0.0"
+APP_VERSION = "5.0.0"
 
-MAX_URL_LENGTH = 2048
+DATABASE_PATH = os.getenv(
+    "DATABASE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "eaq_audit.sqlite3")
+)
+
+REQUEST_TIMEOUT = 12
+MAX_REDIRECTS = 5
+MAX_LINKS_TO_CHECK = 25
 MAX_HTML_BYTES = 2_000_000
-TIMEOUT = 12
-MAX_LINKS = 10
 
-DB_PATH = os.getenv("DATABASE_PATH", "/tmp/eaq_audit.sqlite3")
-PAGESPEED_API_KEY = os.getenv("PAGESPEED_API_KEY", "").strip()
-SIMILARWEB_API_KEY = os.getenv("SIMILARWEB_API_KEY", "").strip()
+USER_AGENT = (
+    "EAQSEOAudit/5.0 "
+    "(Website technical audit; contact site owner before automated testing)"
+)
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("eaq")
-
-app = FastAPI(title=APP_NAME, version=APP_VERSION, docs_url=None, redoc_url=None)
-
-LANGUAGES = {
-    "ar": "العربية",
-    "en": "English",
-    "fr": "Français",
-    "es": "Español",
-    "de": "Deutsch",
-    "zh": "中文",
-}
-
-T = {
-    "ar": {
-        "tagline": "حلّل. أتمت. حسّن.",
-        "heading": "افحص الحالة التقنية لموقعك",
-        "intro": "تحليل SEO والسرعة والروابط وعمر النطاق والتاريخ المتاح.",
-        "url": "رابط الموقع",
-        "audit": "تحليل الموقع",
-        "new": "تحليل جديد",
-        "report": "تقرير الفحص",
-        "score": "نتيجة SEO",
-        "passed": "الفحوصات المستوفاة",
-        "issues": "نقاط تحتاج إلى مراجعة",
-        "details": "النتائج التفصيلية",
-        "priorities": "أولويات التحسين",
-        "good": "جيد مبدئيًا",
-        "warning": "يُنصح بالمراجعة",
-        "title": "عنوان الصفحة",
-        "description": "الوصف التعريفي",
-        "canonical": "الرابط الأساسي Canonical",
-        "headings": "بنية العناوين",
-        "images": "النص البديل للصور",
-        "https": "اتصال HTTPS",
-        "viewport": "إعداد عرض الهاتف",
-        "html_lang": "لغة HTML",
-        "schema": "البيانات المنظمة",
-        "social": "بيانات المشاركة الاجتماعية",
-        "robots_meta": "توجيهات Robots",
-        "status": "حالة الموقع",
-        "speed": "سرعة الموقع - Google PageSpeed",
-        "sitemap": "ملف Robots وخريطة الموقع",
-        "links": "فحص عينة من الروابط",
-        "business": "فحص النشاط التجاري المحلي (اختياري)",
-        "business_enable": "تفعيل فحص النشاط التجاري المحلي",
-        "map_enable": "تحديد موقع النشاط على الخريطة (اختياري)",
-        "business_name": "اسم النشاط التجاري (اختياري)",
-        "address": "عنوان النشاط التجاري (اختياري)",
-        "latitude": "خط العرض",
-        "longitude": "خط الطول",
-        "map_help": "انقر على الخريطة لتحديد الموقع أو أدخل الإحداثيات يدويًا.",
-        "local_result": "نتائج الفحص المحلي",
-        "no_business": "لم تُكتشف بيانات واضحة لنشاط تجاري محلي.",
-        "no_location": "لم يُحدد موقع جغرافي؛ هذا لا يمنع فحص SEO العام.",
-        "domain_age": "عمر النطاق",
-        "created": "تاريخ إنشاء النطاق",
-        "unknown": "غير متاح",
-        "years": "سنة",
-        "history": "التاريخ السنوي للموقع",
-        "archive": "عدد لقطات Wayback Machine السنوية",
-        "visits": "الزيارات الشهرية المقدّرة",
-        "visitors": "الزوار الفريدون المقدّرون",
-        "no_visits": "لا تتوفر بيانات زيارات موثوقة لهذا النطاق.",
-        "no_archive": "لم تتوفر بيانات أرشيف تاريخية.",
-        "source": "المصدر",
-        "updated": "تاريخ جلب البيانات",
-        "speed_none": "بيانات PageSpeed غير متاحة.",
-        "not_rank": "هذه نتيجة قائمة فحوصات وليست ترتيبًا من Google.",
-        "print": "طباعة / حفظ PDF",
-        "saved": "يُحفظ التقرير تلقائيًا.",
-        "report_id": "رقم التقرير",
-        "history_reports": "التقارير المحفوظة",
-        "no_reports": "لا توجد تقارير محفوظة.",
-        "view": "عرض",
-        "delete": "حذف",
-        "date": "التاريخ",
-        "website": "الموقع",
-        "actions": "الإجراءات",
-        "security": "الأمان والخصوصية",
-        "privacy": "يمكن فحص روابط المواقع العامة فقط.",
-        "invalid": "أدخل رابط HTTP أو HTTPS عامًا وصحيحًا.",
-        "error": "تعذر فحص الموقع.",
-        "footer": "إرشادات تقنية لا تضمن ترتيبًا معينًا في نتائج البحث.",
-        "sample": "هذه عينة محدودة من الروابط؛ قد تمنع بعض المواقع الفحص الآلي.",
-        "not_checked": "لم يتم الفحص",
-        "no_robots": "لم يُعثر على robots.txt.",
-        "no_sitemap": "لم تُكتشف خريطة موقع.",
-        "local_note": "الفحص المحلي اختياري. لا تدخل بيانات موقع لا تملك حق استخدامها.",
-    },
-    "en": {
-        "tagline": "Analyze. Automate. Improve.",
-        "heading": "Understand your website's SEO health",
-        "intro": "Check technical SEO, speed, links, domain age and available history.",
-        "url": "Website URL", "audit": "Analyze website", "new": "New audit",
-        "report": "Audit report", "score": "SEO score",
-        "passed": "Passed checks", "issues": "Items to review",
-        "details": "Detailed findings", "priorities": "Recommended priorities",
-        "good": "Looks good", "warning": "Review recommended",
-        "title": "Page title", "description": "Meta description",
-        "canonical": "Canonical URL", "headings": "Heading structure",
-        "images": "Image alt text", "https": "HTTPS",
-        "viewport": "Mobile viewport", "html_lang": "HTML language",
-        "schema": "Structured data", "social": "Social metadata",
-        "robots_meta": "Robots directives", "status": "Website status",
-        "speed": "Google PageSpeed Insights", "sitemap": "Robots and sitemap",
-        "links": "Sampled links", "business": "Local business audit (optional)",
-        "business_enable": "Enable local business audit",
-        "map_enable": "Set business location on map (optional)",
-        "business_name": "Business name (optional)",
-        "address": "Business address (optional)", "latitude": "Latitude",
-        "longitude": "Longitude",
-        "map_help": "Click the map or enter coordinates manually.",
-        "local_result": "Local audit results",
-        "no_business": "No clear local business details detected.",
-        "no_location": "No location provided; general SEO analysis is unaffected.",
-        "domain_age": "Domain age", "created": "Domain creation date",
-        "unknown": "Unavailable", "years": "years",
-        "history": "Website history by year",
-        "archive": "Annual Wayback Machine snapshots",
-        "visits": "Estimated monthly visits",
-        "visitors": "Estimated unique visitors",
-        "no_visits": "No reliable traffic data is available for this domain.",
-        "no_archive": "No historical archive data was found.",
-        "source": "Source", "updated": "Data retrieved",
-        "speed_none": "PageSpeed data is unavailable.",
-        "not_rank": "This is a checklist score, not a Google ranking.",
-        "print": "Print / Save PDF", "saved": "Reports are saved automatically.",
-        "report_id": "Report ID", "history_reports": "Saved reports",
-        "no_reports": "No saved reports.", "view": "View", "delete": "Delete",
-        "date": "Date", "website": "Website", "actions": "Actions",
-        "security": "Security and privacy",
-        "privacy": "Only public website URLs can be analyzed.",
-        "invalid": "Enter a valid public HTTP or HTTPS URL.",
-        "error": "Unable to analyze this website.",
-        "footer": "Technical guidance does not guarantee search rankings.",
-        "sample": "Only a limited sample is checked; some servers block automated requests.",
-        "not_checked": "Not checked", "no_robots": "robots.txt was not found.",
-        "no_sitemap": "No sitemap was detected.",
-        "local_note": "Local audit is optional. Only submit business details you are authorized to use.",
-    },
-}
-
-# Missing French, Spanish, German and Chinese keys fall back to English.
-for _lang in ("fr", "es", "de", "zh"):
-    T[_lang] = dict(T["en"])
+app = FastAPI(
+    title=APP_NAME,
+    version=APP_VERSION,
+    description="Technical SEO audit and website diagnostics"
+)
 
 
-def tr(lang, key):
-    lang = lang if lang in T else "en"
-    return T[lang].get(key, T["en"].get(key, key))
+# ============================================================
+# DATABASE
+# ============================================================
+
+def db_connection():
+    connection = sqlite3.connect(DATABASE_PATH, timeout=20)
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
-def esc(value):
-    return escape(str(value if value is not None else ""), quote=True)
-
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-# ---------------- Database ----------------
-
-def get_db():
-    folder = os.path.dirname(DB_PATH)
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-    try:
-        db = sqlite3.connect(DB_PATH, timeout=10)
-    except sqlite3.OperationalError:
-        db = sqlite3.connect("/tmp/eaq_audit.sqlite3", timeout=10)
-    db.row_factory = sqlite3.Row
-    return db
-
-
-def init_db():
-    with get_db() as db:
-        db.execute("""
+def init_database():
+    with db_connection() as connection:
+        connection.execute("""
             CREATE TABLE IF NOT EXISTS reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 url TEXT NOT NULL,
-                title TEXT,
+                created_at TEXT NOT NULL,
                 score INTEGER NOT NULL,
-                report_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                report_json TEXT NOT NULL
             )
         """)
-        db.commit()
+        connection.commit()
 
 
-init_db()
+init_database()
 
 
-# ---------------- Security ----------------
+# ============================================================
+# HTML HELPERS
+# ============================================================
 
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "SAMEORIGIN"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Permissions-Policy"] = "camera=(), microphone=()"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; "
-            "script-src 'self' https://unpkg.com; "
-            "style-src 'self' 'unsafe-inline' https://unpkg.com; "
-            "img-src 'self' data: https: blob:; "
-            "connect-src 'self' https://unpkg.com; "
-            "font-src 'self' data: https://unpkg.com; "
-            "form-action 'self'; base-uri 'self'; frame-ancestors 'self'"
-        )
-        return response
+def e(value):
+    return escape(str(value if value is not None else ""), quote=True)
 
 
-app.add_middleware(SecurityHeadersMiddleware)
+def page_template(title, body, lang="en"):
+    direction = "rtl" if lang == "ar" else "ltr"
+    language = "ar" if lang == "ar" else "en"
+
+    return f"""<!doctype html>
+<html lang="{language}" dir="{direction}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>{e(title)} | EAQ SEO Audit</title>
+<style>
+:root {{
+  --bg:#f3f6fb;
+  --card:#ffffff;
+  --text:#17253b;
+  --muted:#64748b;
+  --primary:#1456d9;
+  --border:#dce4ef;
+  --green:#16804a;
+  --red:#bd3434;
+  --orange:#a45a00;
+}}
+* {{ box-sizing:border-box; }}
+body {{
+  margin:0;
+  font-family:Arial,Helvetica,sans-serif;
+  background:var(--bg);
+  color:var(--text);
+  line-height:1.65;
+}}
+header {{
+  background:#102747;
+  color:white;
+  padding:22px 16px;
+}}
+nav,.container {{ max-width:1100px; margin:auto; }}
+nav {{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:15px;
+  flex-wrap:wrap;
+}}
+nav a {{ color:white; text-decoration:none; margin-inline-start:14px; }}
+.brand {{ font-size:22px; font-weight:800; letter-spacing:.3px; }}
+.container {{ padding:24px 16px 50px; }}
+.card {{
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:15px;
+  padding:22px;
+  margin-bottom:18px;
+  box-shadow:0 4px 16px rgba(20,40,80,.035);
+}}
+h1,h2,h3 {{ line-height:1.3; }}
+h1 {{ font-size:clamp(25px,4vw,38px); }}
+h2 {{ font-size:22px; margin-top:0; }}
+h3 {{ font-size:17px; }}
+.muted {{ color:var(--muted); }}
+.small {{ font-size:13px; }}
+label {{ display:block; font-weight:700; margin:12px 0 5px; }}
+input[type=url],input[type=text],input[type=number],select {{
+  width:100%;
+  border:1px solid #cbd5e1;
+  border-radius:9px;
+  padding:12px;
+  background:white;
+  font-size:16px;
+}}
+button,.button {{
+  border:0;
+  border-radius:9px;
+  background:var(--primary);
+  color:white;
+  padding:12px 18px;
+  font-size:15px;
+  font-weight:700;
+  cursor:pointer;
+  text-decoration:none;
+  display:inline-block;
+}}
+button:hover,.button:hover {{ opacity:.9; }}
+button:disabled {{ opacity:.6; cursor:wait; }}
+.grid {{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
+  gap:14px;
+}}
+.metric {{
+  background:#f8faff;
+  border:1px solid var(--border);
+  padding:16px;
+  border-radius:12px;
+}}
+.metric strong {{ font-size:27px; display:block; }}
+table {{ width:100%; border-collapse:collapse; }}
+th,td {{
+  padding:11px 9px;
+  border-bottom:1px solid var(--border);
+  text-align:start;
+  vertical-align:top;
+  overflow-wrap:anywhere;
+}}
+th {{ background:#f4f7fc; }}
+.table-wrap {{ overflow-x:auto; }}
+.status-pass {{ color:var(--green); font-weight:700; }}
+.status-fail {{ color:var(--red); font-weight:700; }}
+.status-warn {{ color:var(--orange); font-weight:700; }}
+.pill {{
+  display:inline-block;
+  padding:4px 9px;
+  border-radius:30px;
+  background:#e8efff;
+  color:#1848a8;
+  font-size:12px;
+  font-weight:700;
+}}
+.notice {{
+  background:#fff8e7;
+  border:1px solid #f1d28a;
+  border-radius:10px;
+  padding:12px 15px;
+}}
+footer {{
+  text-align:center;
+  color:var(--muted);
+  padding:20px 12px;
+}}
+a {{ color:var(--primary); }}
+pre {{ white-space:pre-wrap; overflow-wrap:anywhere; }}
+@media print {{
+  header,.no-print,footer {{ display:none!important; }}
+  body {{ background:white; }}
+  .card {{ box-shadow:none; break-inside:avoid; }}
+  .container {{ max-width:none; }}
+}}
+</style>
+</head>
+<body>
+<header>
+<nav>
+  <div class="brand">EAQ <span style="color:#7db1ff">SEO AUDIT</span></div>
+  <div>
+    <a href="/?lang={language}">Home</a>
+    <a href="/reports?lang={language}">Reports</a>
+    <a href="/health">Health</a>
+    <a href="/?lang=ar">العربية</a>
+    <a href="/?lang=en">English</a>
+  </div>
+</nav>
+</header>
+<main class="container">
+{body}
+</main>
+<footer>
+  EAQ SEO Audit v{APP_VERSION} · Technical diagnostics, not a Google ranking guarantee.
+</footer>
+</body>
+</html>"""
 
 
-def validate_public_url(raw):
-    raw = (raw or "").strip()
-    if not raw or len(raw) > MAX_URL_LENGTH:
-        raise ValueError("Invalid URL")
-    if "://" not in raw:
-        raw = "https://" + raw
+# ============================================================
+# URL VALIDATION
+# ============================================================
 
-    parsed = urlparse(raw)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError("Invalid URL scheme")
+def normalize_url(raw_url):
+    raw_url = (raw_url or "").strip()
+
+    if not raw_url:
+        raise ValueError("Please enter a website URL.")
+
+    if len(raw_url) > 2048:
+        raise ValueError("The URL is too long.")
+
+    if not re.match(r"^https?://", raw_url, re.IGNORECASE):
+        raw_url = "https://" + raw_url
+
+    parsed = urlparse(raw_url)
+
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise ValueError("Only HTTP and HTTPS URLs are supported.")
+
+    if not parsed.hostname:
+        raise ValueError("The URL must contain a valid hostname.")
+
     if parsed.username or parsed.password:
-        raise ValueError("Credentials are not allowed")
+        raise ValueError("URLs containing username or password are not allowed.")
+
+    if parsed.port and not (
+        (parsed.scheme.lower() == "http" and parsed.port == 80)
+        or (parsed.scheme.lower() == "https" and parsed.port == 443)
+    ):
+        raise ValueError("Only standard HTTP/HTTPS ports are allowed.")
 
     host = parsed.hostname.rstrip(".").lower()
-    if host == "localhost" or host.endswith(
-        (".localhost", ".local", ".internal", ".test")
-    ):
-        raise ValueError("Private hostname")
+
+    if host == "localhost" or host.endswith(".localhost"):
+        raise ValueError("Local addresses are not allowed.")
+
+    if host.endswith(".local") or host.endswith(".internal"):
+        raise ValueError("Private hostnames are not allowed.")
 
     try:
         ip = ipaddress.ip_address(host)
         if not ip.is_global:
-            raise ValueError("Non-public IP")
+            raise ValueError("Private or reserved IP addresses are not allowed.")
     except ValueError as exc:
-        if str(exc) == "Non-public IP":
+        if "not allowed" in str(exc):
             raise
-        try:
-            addresses = socket.getaddrinfo(host, None)
-        except socket.gaierror:
-            raise ValueError("Hostname could not be resolved")
-        for item in addresses:
-            addr = ipaddress.ip_address(item[4][0])
-            if not addr.is_global:
-                raise ValueError("Hostname resolves to a non-public IP")
+        # A hostname rather than an IP address is expected here.
 
-    if parsed.port and parsed.port not in (80, 443):
-        raise ValueError("Unsupported port")
-
-    return raw
+    return raw_url
 
 
-def safe_get(raw_url, max_redirects=4, stream=False):
-    current = validate_public_url(raw_url)
-    headers = {
-        "User-Agent": "EAQ-SEO-Audit/4.0 (+public website technical checker)",
-        "Accept": "text/html,application/xhtml+xml,application/xml,text/plain,*/*",
-    }
+def hostname_is_public(host):
+    host = (host or "").rstrip(".").lower()
 
-    for _ in range(max_redirects + 1):
-        current = validate_public_url(current)
-        response = requests.get(
-            current,
-            headers=headers,
-            timeout=TIMEOUT,
-            allow_redirects=False,
-            stream=stream,
-        )
-        if response.status_code in (301, 302, 303, 307, 308):
-            location = response.headers.get("Location")
-            response.close()
-            if not location:
-                return None
-            current = urljoin(current, location)
-            continue
-        return response
+    if not host or host == "localhost":
+        return False
 
-    raise ValueError("Too many redirects")
-
-
-def fetch_page(url):
-    response = safe_get(url, stream=True)
-    if response is None:
-        raise ValueError("No response")
-
-    content_type = response.headers.get("Content-Type", "").lower()
-    if "html" not in content_type and "xhtml" not in content_type:
-        response.close()
-        raise ValueError("The URL did not return HTML")
-
-    chunks = []
-    total = 0
-    for chunk in response.iter_content(65536):
-        if not chunk:
-            continue
-        total += len(chunk)
-        if total > MAX_HTML_BYTES:
-            response.close()
-            raise ValueError("HTML document is too large")
-        chunks.append(chunk)
-
-    final_url = response.url
-    status_code = response.status_code
-    response.close()
-
-    raw = b"".join(chunks)
-    soup = BeautifulSoup(raw, "html.parser")
-    return final_url, status_code, soup
-
-
-# ---------------- SEO checks ----------------
-
-def meta_content(soup, name=None, prop=None):
-    for tag in soup.find_all("meta"):
-        if name and (tag.get("name") or "").lower() == name.lower():
-            return (tag.get("content") or "").strip()
-        if prop and (tag.get("property") or "").lower() == prop.lower():
-            return (tag.get("content") or "").strip()
-    return ""
-
-
-def analyze_page(url):
-    final_url, status, soup = fetch_page(url)
-    checks = []
-
-    def add(label, passed, detail):
-        checks.append({
-            "label": label,
-            "passed": bool(passed),
-            "detail": str(detail),
-        })
-
-    title = soup.title.get_text(" ", strip=True) if soup.title else ""
-    description = meta_content(soup, name="description")
-    canonical_tag = soup.find("link", rel=lambda x: x and "canonical" in x)
-    canonical = canonical_tag.get("href", "").strip() if canonical_tag else ""
-    h1s = soup.find_all("h1")
-    imgs = soup.find_all("img")
-    missing_alt = sum(1 for img in imgs if img.get("alt") is None)
-    viewport = meta_content(soup, name="viewport")
-    html_lang = (soup.html.get("lang", "") if soup.html else "").strip()
-    robots = meta_content(soup, name="robots")
-    jsonld = soup.find_all("script", type="application/ld+json")
-    social = bool(
-        meta_content(soup, prop="og:title")
-        or meta_content(soup, prop="og:description")
-        or meta_content(soup, name="twitter:card")
-    )
-
-    # Absence of a robots meta tag is not itself an SEO error.
-    robots_ok = not robots or not re.search(r"\bnoindex\b", robots, re.I)
-
-    add("Page title", bool(title), title or "Missing page title")
-    add("Meta description", bool(description), description or "Missing meta description")
-    add("Canonical URL", bool(canonical), canonical or "No canonical link detected")
-    add("Heading structure", len(h1s) == 1, f"{len(h1s)} H1 heading(s)")
-    add("Image alt text", missing_alt == 0, f"{missing_alt} image(s) without alt out of {len(imgs)}")
-    add("HTTPS", final_url.lower().startswith("https://"), final_url)
-    add("Mobile viewport", bool(viewport), "Viewport metadata present" if viewport else "Viewport metadata missing")
-    add("HTML language", bool(html_lang), html_lang or "HTML lang attribute missing")
-    add("Structured data", bool(jsonld), f"{len(jsonld)} JSON-LD block(s)")
-    add("Social metadata", social, "Social metadata present" if social else "Social metadata missing")
-    add("Robots directives", robots_ok, robots or "No restrictive robots meta directive detected")
-    add("Website status", 200 <= status < 400, f"HTTP {status}")
-
-    business_types = (
-        "LocalBusiness", "Organization", "ProfessionalService", "Store",
-        "MedicalBusiness", "Corporation", "HomeAndConstructionBusiness",
-    )
-    business_detected = False
-    for block in jsonld:
-        try:
-            data = json.loads(block.string or block.get_text())
-            stack = data if isinstance(data, list) else [data]
-            while stack:
-                obj = stack.pop()
-                if not isinstance(obj, dict):
-                    continue
-                typ = obj.get("@type", [])
-                if isinstance(typ, str):
-                    typ = [typ]
-                if any(any(bt.lower() in str(x).lower() for bt in business_types) for x in typ):
-                    business_detected = True
-                graph = obj.get("@graph")
-                if isinstance(graph, list):
-                    stack.extend(graph)
-        except Exception:
-            continue
-
-    # General SEO score excludes local business information.
-    passed = sum(1 for c in checks if c["passed"])
-    score = round(100 * passed / max(1, len(checks)))
-
-    links = []
-    seen = set()
-    for a in soup.find_all("a", href=True):
-        href = urljoin(final_url, a["href"].strip())
-        p = urlparse(href)
-        if p.scheme not in ("http", "https") or not p.hostname:
-            continue
-        if href in seen:
-            continue
-        seen.add(href)
-        links.append(href)
-        if len(links) >= MAX_LINKS:
-            break
-
-    return {
-        "url": url,
-        "final_url": final_url,
-        "http_status": status,
-        "title": title,
-        "description": description,
-        "canonical": canonical,
-        "score": score,
-        "passed": passed,
-        "total_checks": len(checks),
-        "checks": checks,
-        "links": links,
-        "business_detected": business_detected,
-        "html_lang": html_lang,
-    }
-
-
-def check_one_link(url):
-    try:
-        r = safe_get(url, max_redirects=3)
-        if r is None:
-            return {"url": url, "status": 0, "result": "No response"}
-        status = r.status_code
-        r.close()
-        return {"url": url, "status": status, "result": "OK" if status < 400 else "Review"}
-    except Exception as exc:
-        return {"url": url, "status": 0, "result": type(exc).__name__}
-
-
-def check_robots_sitemap(site_url):
-    p = urlparse(site_url)
-    base = f"{p.scheme}://{p.netloc}"
-    robots_url = base + "/robots.txt"
-    sitemap_url = base + "/sitemap.xml"
-
-    out = {"robots": None, "sitemap": None}
-    for key, target in (("robots", robots_url), ("sitemap", sitemap_url)):
-        try:
-            r = safe_get(target, max_redirects=3)
-            if r:
-                out[key] = {"url": target, "status": r.status_code}
-                r.close()
-        except Exception:
-            out[key] = {"url": target, "status": 0}
-    return out
-
-
-def pagespeed_data(url):
-    params = {"url": url, "category": ["PERFORMANCE", "SEO"]}
-    if PAGESPEED_API_KEY:
-        params["key"] = PAGESPEED_API_KEY
+    if host.endswith((".local", ".localhost", ".internal")):
+        return False
 
     try:
-        endpoint = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
-        r = requests.get(endpoint, params=params, timeout=25)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        cats = data.get("lighthouseResult", {}).get("categories", {})
-        result = {}
-        for key in ("performance", "seo"):
-            item = cats.get(key)
-            if item and item.get("score") is not None:
-                result[key] = round(item["score"] * 100)
-        return result or None
-    except Exception:
-        return None
-
-
-# ---------------- Domain age and history ----------------
-
-def get_domain_age(url):
-    host = (urlparse(url).hostname or "").lower().strip(".")
-    if not host:
-        return {"domain": "", "created": None, "age_days": None, "age_years": None, "source": "RDAP"}
-
-    # IP addresses do not have domain registration dates.
-    try:
-        ipaddress.ip_address(host)
-        return {"domain": host, "created": None, "age_days": None, "age_years": None, "source": "RDAP"}
+        ip = ipaddress.ip_address(host)
+        return ip.is_global
     except ValueError:
         pass
 
     try:
-        r = requests.get(
-            "https://rdap.org/domain/" + host,
-            headers={"User-Agent": "EAQ-SEO-Audit/4.0"},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            return {"domain": host, "created": None, "age_days": None, "age_years": None, "source": "RDAP"}
-        data = r.json()
-        created = None
-        for event in data.get("events", []):
-            if event.get("eventAction", "").lower() == "registration":
-                created = event.get("eventDate")
-                break
-        if not created:
-            return {"domain": host, "created": None, "age_days": None, "age_years": None, "source": "RDAP"}
-        dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-        days = max(0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).days)
-        return {
-            "domain": host,
-            "created": dt.date().isoformat(),
-            "age_days": days,
-            "age_years": round(days / 365.2425, 1),
-            "source": "RDAP",
-        }
-    except Exception:
-        return {"domain": host, "created": None, "age_days": None, "age_years": None, "source": "RDAP"}
+        addresses = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except (socket.gaierror, OSError):
+        return False
+
+    if not addresses:
+        return False
+
+    for address in addresses:
+        ip_text = address[4][0]
+
+        try:
+            ip = ipaddress.ip_address(ip_text)
+            if not ip.is_global:
+                return False
+        except ValueError:
+            return False
+
+    return True
 
 
-def get_wayback_history(url):
-    host = (urlparse(url).hostname or "").lower()
-    if not host:
-        return []
+def safe_get(raw_url, timeout=REQUEST_TIMEOUT, max_bytes=MAX_HTML_BYTES):
+    """
+    Fetch a public HTTP(S) URL and validate each redirect destination.
+    This is a basic safety layer, not a guarantee against every DNS-rebinding
+    or network-level SSRF scenario.
+    """
+    url = normalize_url(raw_url)
+    session = requests.Session()
+    session.trust_env = False
+
+    headers = {"User-Agent": USER_AGENT}
+    current_url = url
+    response = None
+
     try:
-        params = {
-            "url": host + "/*",
-            "output": "json",
-            "fl": "timestamp",
-            "filter": "statuscode:200",
-            "collapse": "timestamp:4",
-        }
-        r = requests.get(
-            "https://web.archive.org/cdx/search/cdx",
-            params=params,
-            timeout=18,
-            headers={"User-Agent": "EAQ-SEO-Audit/4.0"},
-        )
-        if r.status_code != 200:
-            return []
-        rows = r.json()
-        years = {}
-        for row in rows[1:]:
-            if not row or not row[0] or len(row[0]) < 4:
+        for _ in range(MAX_REDIRECTS + 1):
+            parsed = urlparse(current_url)
+
+            if not hostname_is_public(parsed.hostname):
+                raise ValueError("The hostname is private, reserved, or cannot be resolved safely.")
+
+            response = session.get(
+                current_url,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=False,
+                stream=True
+            )
+
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location")
+
+                if not location:
+                    return response
+
+                next_url = urljoin(current_url, location)
+                response.close()
+                current_url = normalize_url(next_url)
                 continue
-            year = row[0][:4]
-            if year.isdigit():
-                years[year] = years.get(year, 0) + 1
-        return [{"year": y, "count": years[y]} for y in sorted(years)]
-    except Exception:
-        return []
+
+            content = bytearray()
+
+            for chunk in response.iter_content(chunk_size=16384):
+                if not chunk:
+                    continue
+
+                remaining = max_bytes - len(content)
+                content.extend(chunk[:remaining])
+
+                if len(content) >= max_bytes:
+                    break
+
+            response._content = bytes(content)
+            response._content_consumed = True
+            return response
+
+        raise ValueError("Too many redirects.")
+
+    finally:
+        session.close()
 
 
-def get_similarweb_data(url):
-    if not SIMILARWEB_API_KEY:
-        return None
+def fetch_text(url, timeout=REQUEST_TIMEOUT, max_bytes=MAX_HTML_BYTES):
+    response = safe_get(url, timeout=timeout, max_bytes=max_bytes)
+    try:
+        return {
+            "status": response.status_code,
+            "url": response.url,
+            "headers": dict(response.headers),
+            "text": response.text,
+            "content_type": response.headers.get("Content-Type", "")
+        }
+    finally:
+        response.close()
 
-    host = (urlparse(url).hostname or "").lower()
-    endpoint = f"https://api.similarweb.com/v1/website/{host}/total-traffic-and-engagement/visits"
-    params = {
-        "api_key": SIMILARWEB_API_KEY,
-        "start_date": "2025-01",
-        "end_date": datetime.now().strftime("%Y-%m"),
-        "granularity": "monthly",
-        "main_domain_only": "true",
-        "format": "json",
+
+# ============================================================
+# DOMAIN HELPERS
+# ============================================================
+
+def get_domain(url):
+    return (urlparse(url).hostname or "").lower().rstrip(".")
+
+
+def registrable_domain(host):
+    """
+    Approximate registrable domain. This is not a full Public Suffix List
+    implementation; unusual multi-level suffixes may need manual review.
+    """
+    host = (host or "").lower().strip(".")
+    parts = host.split(".")
+
+    if len(parts) <= 2:
+        return host
+
+    common_two_level_suffixes = {
+        "co.uk", "org.uk", "me.uk", "ac.uk", "gov.uk",
+        "com.au", "net.au", "org.au",
+        "co.nz", "org.nz",
+        "co.jp", "co.in",
+        "com.br", "com.cn", "com.sg",
+        "com.mx", "com.tr", "com.sa"
     }
 
+    suffix2 = ".".join(parts[-2:])
+
+    if suffix2 in common_two_level_suffixes and len(parts) >= 3:
+        return ".".join(parts[-3:])
+
+    return ".".join(parts[-2:])
+
+
+# ============================================================
+# TECHNICAL SEO CHECKS
+# ============================================================
+
+def add_check(checks, name, passed, details, severity="warning"):
+    checks.append({
+        "name": name,
+        "passed": bool(passed),
+        "details": str(details),
+        "severity": severity
+    })
+
+
+def check_robots_and_sitemap(base_url):
+    results = {}
+
+    robots_url = urljoin(base_url, "/robots.txt")
+    sitemap_url = urljoin(base_url, "/sitemap.xml")
+
+    for key, target in (("robots", robots_url), ("sitemap", sitemap_url)):
+        try:
+            result = fetch_text(target, timeout=8, max_bytes=300000)
+            results[key] = {
+                "url": result["url"],
+                "status": result["status"],
+                "text": result["text"][:100000],
+                "content_type": result["content_type"]
+            }
+        except Exception as exc:
+            results[key] = {
+                "url": target,
+                "status": None,
+                "text": "",
+                "error": str(exc)[:250]
+            }
+
+    return results
+
+
+def run_technical_audit(url):
+    checks = []
+    supplementary = {}
+    final_url = url
+    response = None
+
     try:
-        r = requests.get(endpoint, params=params, timeout=20)
-        if r.status_code != 200:
-            logger.info("Similarweb API unavailable: %s", r.status_code)
-            return None
-        data = r.json()
-        items = data.get("visits", [])
-        rows = []
-        for item in items:
-            date = item.get("date")
-            value = item.get("visits")
-            if date is not None and isinstance(value, (int, float)):
-                rows.append({"month": str(date), "visits": int(value)})
-        return {"source": "Similarweb API", "monthly": rows} if rows else None
-    except Exception as exc:
-        logger.info("Similarweb unavailable: %s", exc)
-        return None
+        response = safe_get(url)
+        final_url = response.url
 
+        status = response.status_code
+        content_type = response.headers.get("Content-Type", "")
+        html = response.text[:MAX_HTML_BYTES]
+        headers = dict(response.headers)
 
-# ---------------- Local business checks ----------------
+    finally:
+        if response is not None:
+            response.close()
 
-def validate_coordinates(latitude, longitude):
-    if latitude in (None, "") or longitude in (None, ""):
-        return None
-    try:
-        lat = float(latitude)
-        lon = float(longitude)
-    except (TypeError, ValueError):
-        return None
-    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-        return None
-    return {"latitude": lat, "longitude": lon}
+    soup = BeautifulSoup(html, "html.parser")
+    title_tag = soup.find("title")
+    title = title_tag.get_text(" ", strip=True) if title_tag else ""
 
+    description_tag = soup.find(
+        "meta",
+        attrs={"name": re.compile("^description$", re.I)}
+    )
+    description = (
+        description_tag.get("content", "").strip()
+        if description_tag else ""
+    )
 
-def local_business_report(page, enabled, map_enabled, name, address, latitude, longitude):
-    if not enabled:
-        return None
+    canonical_tag = soup.find(
+        "link",
+        attrs={"rel": lambda value: value and "canonical" in value}
+    )
+    canonical = canonical_tag.get("href", "").strip() if canonical_tag else ""
 
-    coords = validate_coordinates(latitude, longitude) if map_enabled else None
-    issues = []
-    if not name.strip():
-        issues.append("Business name was not provided.")
-    if not address.strip():
-        issues.append("Business address was not provided.")
-    if map_enabled and not coords:
-        issues.append("A valid map location was not provided.")
+    h1_tags = soup.find_all("h1")
+    images = soup.find_all("img")
+    images_missing_alt = [
+        image_tag for image_tag in images
+        if not image_tag.has_attr("alt")
+    ]
+
+    viewport = soup.find(
+        "meta",
+        attrs={"name": re.compile("^viewport$", re.I)}
+    )
+
+    charset = soup.find("meta", attrs={"charset": True})
+    if charset:
+        charset_value = charset.get("charset", "")
+    else:
+        charset_value = ""
+
+    if not charset_value:
+        equiv = soup.find(
+            "meta",
+            attrs={"http-equiv": re.compile("^content-type$", re.I)}
+        )
+        if equiv:
+            charset_value = equiv.get("content", "")
+
+    links = []
+    for tag in soup.find_all("a", href=True):
+        href = tag.get("href", "").strip()
+
+        if not href:
+            continue
+
+        if href.startswith(("#", "mailto:", "tel:", "javascript:", "data:")):
+            continue
+
+        absolute = urljoin(final_url, href)
+
+        if urlparse(absolute).scheme.lower() in ("http", "https"):
+            links.append({
+                "url": absolute,
+                "text": tag.get_text(" ", strip=True)[:160]
+            })
+
+    robots_and_sitemap = check_robots_and_sitemap(final_url)
+
+    supplementary["robots"] = {
+        "url": robots_and_sitemap["robots"]["url"],
+        "status": robots_and_sitemap["robots"].get("status"),
+        "error": robots_and_sitemap["robots"].get("error"),
+        "preview": robots_and_sitemap["robots"].get("text", "")[:1200]
+    }
+
+    supplementary["sitemap"] = {
+        "url": robots_and_sitemap["sitemap"]["url"],
+        "status": robots_and_sitemap["sitemap"].get("status"),
+        "error": robots_and_sitemap["sitemap"].get("error")
+    }
+
+    robots_text = robots_and_sitemap["robots"].get("text", "")
+    sitemap_text = robots_and_sitemap["sitemap"].get("text", "")
+
+    sitemap_is_xml = False
+    if sitemap_text.strip():
+        try:
+            ElementTree.fromstring(sitemap_text)
+            sitemap_is_xml = True
+        except ElementTree.ParseError:
+            sitemap_is_xml = False
+
+    add_check(
+        checks, "HTTP response",
+        200 <= status < 400,
+        f"HTTP {status}",
+        "critical"
+    )
+
+    add_check(
+        checks, "HTML content type",
+        "html" in content_type.lower(),
+        content_type or "Content-Type header missing"
+    )
+
+    add_check(
+        checks, "Page title",
+        bool(title),
+        f"Title: {title[:180]}" if title else "No title tag found"
+    )
+
+    title_length = len(title)
+    add_check(
+        checks, "Title length",
+        30 <= title_length <= 60,
+        f"{title_length} characters; a common guideline is about 30–60 characters"
+    )
+
+    add_check(
+        checks, "Meta description",
+        bool(description),
+        f"Description: {description[:220]}" if description else "Meta description not found"
+    )
+
+    desc_length = len(description)
+    add_check(
+        checks, "Meta description length",
+        70 <= desc_length <= 160,
+        f"{desc_length} characters; a common guideline is about 70–160 characters"
+    )
+
+    add_check(
+        checks, "H1 heading",
+        len(h1_tags) >= 1,
+        f"{len(h1_tags)} H1 heading(s) found"
+    )
+
+    add_check(
+        checks, "Single H1",
+        len(h1_tags) == 1,
+        f"{len(h1_tags)} H1 heading(s); multiple H1s are not automatically an SEO error"
+    )
+
+    add_check(
+        checks, "Canonical URL",
+        bool(canonical),
+        canonical or "Canonical link not found"
+    )
+
+    if canonical:
+        canonical_url = urljoin(final_url, canonical)
+        add_check(
+            checks, "Canonical URL format",
+            urlparse(canonical_url).scheme in ("http", "https"),
+            canonical_url
+        )
+    else:
+        add_check(
+            checks, "Canonical URL format",
+            False,
+            "Cannot evaluate because no canonical link was found"
+        )
+
+    add_check(
+        checks, "Viewport meta",
+        viewport is not None,
+        "Viewport meta tag found" if viewport else "Viewport meta tag not found"
+    )
+
+    add_check(
+        checks, "Character encoding",
+        bool(charset_value) or "charset=" in content_type.lower(),
+        charset_value or content_type or "Encoding not explicitly detected"
+    )
+
+    add_check(
+        checks, "Image alt attributes",
+        len(images_missing_alt) == 0,
+        f"{len(images_missing_alt)} of {len(images)} images lack an alt attribute"
+    )
+
+    add_check(
+        checks, "HTTPS",
+        urlparse(final_url).scheme.lower() == "https",
+        final_url
+    )
+
+    add_check(
+        checks, "robots.txt",
+        robots_and_sitemap["robots"].get("status") == 200,
+        f"HTTP {robots_and_sitemap['robots'].get('status')}"
+        if robots_and_sitemap["robots"].get("status") is not None
+        else robots_and_sitemap["robots"].get("error", "Unavailable")
+    )
+
+    add_check(
+        checks, "Sitemap XML",
+        robots_and_sitemap["sitemap"].get("status") == 200 and sitemap_is_xml,
+        (
+            f"HTTP {robots_and_sitemap['sitemap'].get('status')}; XML parsed successfully"
+            if sitemap_and_status_ok(robots_and_sitemap, sitemap_is_xml)
+            else f"HTTP {robots_and_sitemap['sitemap'].get('status')}; valid XML not confirmed"
+        )
+    )
+
+    supplementary.update({
+        "title": title,
+        "title_length": title_length,
+        "description": description,
+        "description_length": desc_length,
+        "h1_count": len(h1_tags),
+        "h1_text": [
+            tag.get_text(" ", strip=True)[:160]
+            for tag in h1_tags[:10]
+        ],
+        "canonical": canonical,
+        "viewport": bool(viewport),
+        "image_count": len(images),
+        "images_missing_alt": len(images_missing_alt),
+        "charset": charset_value,
+        "content_type": content_type,
+        "server": headers.get("Server", "Not disclosed"),
+        "final_url": final_url,
+        "link_count": len(links),
+        "links": links[:MAX_LINKS_TO_CHECK]
+    })
+
+    passed = sum(1 for check in checks if check["passed"])
+    score = round(100 * passed / len(checks)) if checks else 0
 
     return {
-        "enabled": True,
-        "name": name.strip(),
-        "address": address.strip(),
-        "coordinates": coords,
-        "structured_business_detected": page["business_detected"],
-        "issues": issues,
+        "requested_url": url,
+        "final_url": final_url,
+        "http_status": status,
+        "score": score,
+        "passed_checks": passed,
+        "total_checks": len(checks),
+        "checks": checks,
+        "details": supplementary,
+        "generated_at": datetime.now(timezone.utc).isoformat()
     }
 
 
-# ---------------- HTML helpers and charts ----------------
-
-def layout(lang, body, title=APP_NAME, extra_head=""):
-    rtl = "rtl" if lang == "ar" else "ltr"
-    language_options = "".join(
-        f'<option value="{k}" {"selected" if k == lang else ""}>{esc(v)}</option>'
-        for k, v in LANGUAGES.items()
+def sitemap_and_status_ok(results, sitemap_is_xml):
+    return (
+        results["sitemap"].get("status") == 200
+        and sitemap_is_xml
     )
-    return f"""<!doctype html>
-<html lang="{esc(lang)}" dir="{rtl}">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{esc(title)} - {APP_NAME}</title>
-<style>
-:root{{--bg:#f4f7fb;--card:#fff;--text:#172337;--muted:#627188;--line:#dce4ef;--blue:#2563eb;--green:#15803d;--red:#b91c1c}}
-*{{box-sizing:border-box}}
-body{{margin:0;background:var(--bg);color:var(--text);font-family:Arial,sans-serif;line-height:1.65}}
-header{{background:#10213d;color:#fff;padding:20px 16px}}
-.wrap{{max-width:1120px;margin:auto;padding:18px}}
-.brand{{font-size:23px;font-weight:800}}
-.tagline{{opacity:.85}}
-nav{{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap}}
-select,input,button{{font:inherit}}
-select,input[type=text],input[type=url],input[type=number]{{padding:10px;border:1px solid #bdc9da;border-radius:9px;width:100%;background:white;color:#172337}}
-label{{font-weight:600;display:block;margin:9px 0 5px}}
-button,.btn{{display:inline-block;background:var(--blue);color:#fff;border:0;border-radius:9px;padding:10px 15px;text-decoration:none;cursor:pointer;font-weight:700}}
-button.secondary,.btn.secondary{{background:#e7edf6;color:#172337}}
-.card{{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:18px;margin:14px 0;box-shadow:0 3px 14px #14294a08}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:13px}}
-.kpi{{font-size:27px;font-weight:800}}
-.muted{{color:var(--muted);font-size:14px}}
-.pill{{display:inline-block;padding:3px 9px;border-radius:20px;background:#e8f7ee;color:var(--green);font-size:13px}}
-.warn{{background:#fff3d8;color:#8a5100}}
-.fail{{background:#fee2e2;color:var(--red)}}
-table{{width:100%;border-collapse:collapse;overflow-wrap:anywhere}}
-th,td{{padding:10px;border-bottom:1px solid var(--line);text-align:start;vertical-align:top}}
-th{{background:#f0f4fa}}
-.chart{{width:100%;max-width:100%;height:auto;display:block}}
-.scorebox{{display:flex;gap:24px;align-items:center;flex-wrap:wrap}}
-.donut{{width:160px;max-width:45vw}}
-.map{{height:340px;border-radius:12px;overflow:hidden;border:1px solid var(--line);margin-top:12px}}
-footer{{text-align:center;color:var(--muted);padding:25px}}
-.actions{{display:flex;gap:8px;flex-wrap:wrap}}
-details{{margin-top:12px}}
-a{{color:#1d4ed8}}
-@media(max-width:600px){{.wrap{{padding:10px}}.card{{padding:13px}}th,td{{padding:7px;font-size:13px}}}}
-@media print{{body{{background:#fff}}header,.no-print,footer{{display:none!important}}.wrap{{max-width:none;padding:0}}.card{{box-shadow:none;break-inside:avoid}}a{{color:#111;text-decoration:none}}}}
-</style>
-{extra_head}
-</head>
-<body>
-<header><div class="wrap"><nav>
-<div><div class="brand">{APP_NAME}</div><div class="tagline">{esc(tr(lang, "tagline"))}</div></div>
-<form method="get" action="/" class="no-print" style="display:flex;gap:8px;align-items:center">
-<label for="lang" style="margin:0">{esc("اللغة" if lang=="ar" else "Language")}</label>
-<select id="lang" name="lang" onchange="this.form.submit()" style="width:auto">{language_options}</select>
-</form>
-</nav></div></header>
-<main class="wrap">{body}</main>
-<footer>{esc(tr(lang, "footer"))}</footer>
-</body></html>"""
 
 
-def donut_svg(score, passed, total, size=160):
-    score = max(0, min(100, int(score)))
-    circumference = 2 * 3.141592653589793 * 43
-    dash = circumference * score / 100
-    color = "#16a34a" if score >= 80 else ("#d97706" if score >= 55 else "#dc2626")
-    return f"""
-<svg class="donut" viewBox="0 0 120 120" role="img" aria-label="SEO score {score}">
-<circle cx="60" cy="60" r="43" fill="none" stroke="#e5eaf2" stroke-width="11"/>
-<circle cx="60" cy="60" r="43" fill="none" stroke="{color}" stroke-width="11"
-stroke-linecap="round" stroke-dasharray="{dash:.2f} {circumference:.2f}"
-transform="rotate(-90 60 60)"/>
-<text x="60" y="56" text-anchor="middle" font-size="25" font-weight="800" fill="currentColor">{score}</text>
-<text x="60" y="74" text-anchor="middle" font-size="10" fill="currentColor">/ 100</text>
-</svg>"""
+# ============================================================
+# LINK CHECKER
+# ============================================================
 
+def check_links(urls):
+    output = []
 
-def line_chart_svg(items, xkey, ykey, title, color="#2563eb"):
-    if not items:
-        return '<p class="muted">No chart data available.</p>'
+    for item in urls[:MAX_LINKS_TO_CHECK]:
+        link_url = item.get("url", "")
+        link_text = item.get("text", "")
 
-    values = []
-    for item in items:
+        record = {
+            "url": link_url,
+            "text": link_text,
+            "status": None,
+            "result": "",
+            "category": "unknown"
+        }
+
         try:
-            values.append(float(item[ykey]))
-        except (ValueError, TypeError, KeyError):
-            values.append(0.0)
+            result = fetch_text(link_url, timeout=8, max_bytes=1000)
+            status = result["status"]
+            record["status"] = status
 
-    width, height = 760, 270
-    left, right, top, bottom = 58, 20, 28, 55
-    plot_w, plot_h = width-left-right, height-top-bottom
-    max_v = max(values) if values else 1
-    if max_v <= 0:
-        max_v = 1
-    min_v = min(0, min(values))
-    span = max_v - min_v
-    if span <= 0:
-        span = 1
+            if 200 <= status < 400:
+                record["result"] = "Reachable"
+                record["category"] = "ok"
+            elif status in (401, 403, 429):
+                record["result"] = "Blocked, restricted, or rate limited; review manually"
+                record["category"] = "review"
+            elif status == 404 or status == 410:
+                record["result"] = "Target reports the resource is missing"
+                record["category"] = "broken"
+            else:
+                record["result"] = f"HTTP {status}; review manually"
+                record["category"] = "review"
 
-    points = []
-    labels = []
-    for i, (item, value) in enumerate(zip(items, values)):
-        x = left + (plot_w * i / max(1, len(items)-1))
-        y = top + plot_h - ((value-min_v)/span)*plot_h
-        points.append((x, y))
-        label = str(item.get(xkey, ""))[:10]
-        labels.append(f'<text x="{x:.1f}" y="{height-25}" font-size="11" text-anchor="middle" fill="currentColor">{esc(label)}</text>')
+        except Exception as exc:
+            record["result"] = f"Could not verify: {str(exc)[:180]}"
+            record["category"] = "unknown"
 
-    polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
-    circles = "".join(
-        f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" fill="{color}"><title>{esc(items[i].get(xkey,""))}: {values[i]:,.0f}</title></circle>'
-        for i, (x, y) in enumerate(points)
-    )
-    grid = []
-    for i in range(5):
-        y = top + plot_h * i / 4
-        value = max_v - (max_v-min_v)*i/4
-        grid.append(
-            f'<line x1="{left}" y1="{y:.1f}" x2="{width-right}" y2="{y:.1f}" stroke="#dfe6f0"/>'
-            f'<text x="{left-8}" y="{y+4:.1f}" font-size="10" text-anchor="end" fill="currentColor">{value:,.0f}</text>'
+        output.append(record)
+        time.sleep(0.05)
+
+    return output
+
+
+# ============================================================
+# PAGESPEED INSIGHTS
+# ============================================================
+
+def get_pagespeed(url, strategy="mobile"):
+    endpoint = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+
+    params = {
+        "url": url,
+        "strategy": strategy,
+        "category": ["PERFORMANCE", "SEO", "ACCESSIBILITY", "BEST_PRACTICES"]
+    }
+
+    api_key = os.getenv("PAGESPEED_API_KEY")
+    if api_key:
+        params["key"] = api_key
+
+    try:
+        response = requests.get(
+            endpoint,
+            params=params,
+            timeout=45,
+            headers={"User-Agent": USER_AGENT}
         )
 
-    return f"""
-<div class="card">
-<h3>{esc(title)}</h3>
-<svg class="chart" viewBox="0 0 {width} {height}" role="img" aria-label="{esc(title)}">
-{''.join(grid)}
-<polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
-{circles}
-{''.join(labels)}
-</svg>
-</div>"""
+        if response.status_code != 200:
+            return {
+                "available": False,
+                "strategy": strategy,
+                "error": f"Google PageSpeed returned HTTP {response.status_code}"
+            }
+
+        data = response.json()
+        lighthouse = data.get("lighthouseResult", {})
+        categories = lighthouse.get("categories", {})
+        scores = {}
+
+        for key, category in categories.items():
+            score = category.get("score")
+            scores[key] = round(score * 100) if isinstance(score, (int, float)) else None
+
+        audits = lighthouse.get("audits", {})
+        selected_audits = {}
+
+        for key in (
+            "first-contentful-paint",
+            "largest-contentful-paint",
+            "speed-index",
+            "total-blocking-time",
+            "cumulative-layout-shift",
+            "interactive"
+        ):
+            audit = audits.get(key, {})
+            selected_audits[key] = {
+                "title": audit.get("title", key),
+                "display_value": audit.get("displayValue"),
+                "numeric_value": audit.get("numericValue"),
+                "score": audit.get("score")
+            }
+
+        return {
+            "available": True,
+            "strategy": strategy,
+            "scores": scores,
+            "metrics": selected_audits,
+            "fetch_time": lighthouse.get("fetchTime"),
+            "final_url": lighthouse.get("finalDisplayedUrl", url)
+        }
+
+    except Exception as exc:
+        return {
+            "available": False,
+            "strategy": strategy,
+            "error": str(exc)[:250]
+        }
 
 
-def pie_svg(passed, failed):
-    total = max(1, passed + failed)
-    pct = 100 * passed / total
-    c = 2 * 3.141592653589793 * 42
-    dash = c * pct / 100
-    return f"""
-<svg class="donut" viewBox="0 0 120 120" role="img" aria-label="Passed and failed checks">
-<circle cx="60" cy="60" r="42" fill="none" stroke="#fee2e2" stroke-width="14"/>
-<circle cx="60" cy="60" r="42" fill="none" stroke="#16a34a" stroke-width="14"
-stroke-dasharray="{dash:.2f} {c:.2f}" transform="rotate(-90 60 60)"/>
-<text x="60" y="56" font-size="22" font-weight="800" text-anchor="middle" fill="currentColor">{passed}</text>
-<text x="60" y="72" font-size="10" text-anchor="middle" fill="currentColor">/{total}</text>
-</svg>"""
+# ============================================================
+# RDAP DOMAIN AGE
+# ============================================================
+
+def get_domain_age(url):
+    domain = registrable_domain(get_domain(url))
+    endpoint = f"https://rdap.org/domain/{domain}"
+
+    try:
+        response = requests.get(
+            endpoint,
+            timeout=15,
+            headers={
+                "Accept": "application/rdap+json, application/json",
+                "User-Agent": USER_AGENT
+            },
+            allow_redirects=True
+        )
+
+        if response.status_code != 200:
+            return {
+                "available": False,
+                "domain": domain,
+                "error": f"RDAP returned HTTP {response.status_code}"
+            }
+
+        data = response.json()
+        created = None
+
+        for event in data.get("events", []):
+            action = str(event.get("eventAction", "")).lower()
+
+            if action in ("registration", "registered", "creation"):
+                created = event.get("eventDate")
+                break
+
+        if not created:
+            return {
+                "available": False,
+                "domain": domain,
+                "error": "Registration date was not provided by the RDAP response"
+            }
+
+        created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+
+        age_days = max(0, (now - created_dt).days)
+
+        return {
+            "available": True,
+            "domain": domain,
+            "created_at": created,
+            "age_days": age_days,
+            "age_years": round(age_days / 365.2425, 2)
+        }
+
+    except Exception as exc:
+        return {
+            "available": False,
+            "domain": domain,
+            "error": str(exc)[:250]
+        }
 
 
-def render_table(rows, columns):
-    if not rows:
-        return '<p class="muted">No data available.</p>'
-    head = "".join(f"<th>{esc(label)}</th>" for _, label in columns)
-    body = []
-    for row in rows:
-        cells = "".join(f"<td>{esc(row.get(key, ''))}</td>" for key, _ in columns)
-        body.append(f"<tr>{cells}</tr>")
-    return f"<div style='overflow-x:auto'><table><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table></div>"
+# ============================================================
+# WAYBACK MACHINE
+# ============================================================
+
+def get_wayback_history(url):
+    domain = registrable_domain(get_domain(url))
+    endpoint = "https://web.archive.org/cdx/search/cdx"
+
+    params = {
+        "url": domain + "/*",
+        "output": "json",
+        "fl": "timestamp,statuscode",
+        "filter": "statuscode:200",
+        "collapse": "timestamp:4",
+        "from": "1996"
+    }
+
+    try:
+        response = requests.get(
+            endpoint,
+            params=params,
+            timeout=25,
+            headers={"User-Agent": USER_AGENT}
+        )
+
+        if response.status_code != 200:
+            return {
+                "available": False,
+                "domain": domain,
+                "error": f"Wayback Machine returned HTTP {response.status_code}"
+            }
+
+        data = response.json()
+
+        if not isinstance(data, list) or len(data) <= 1:
+            return {
+                "available": True,
+                "domain": domain,
+                "total_returned": 0,
+                "years": {},
+                "note": "No matching snapshots were returned by this query."
+            }
+
+        years = {}
+
+        for row in data[1:]:
+            if not row or not row[0] or len(row[0]) < 4:
+                continue
+
+            year = row[0][:4]
+            years[year] = years.get(year, 0) + 1
+
+        return {
+            "available": True,
+            "domain": domain,
+            "total_returned": len(data) - 1,
+            "years": dict(sorted(years.items())),
+            "note": (
+                "Counts represent records returned by this query, "
+                "not a guaranteed total of all archived pages."
+            )
+        }
+
+    except Exception as exc:
+        return {
+            "available": False,
+            "domain": domain,
+            "error": str(exc)[:250]
+        }
 
 
-# ---------------- Pages ----------------
+# ============================================================
+# OPTIONAL TRAFFIC ESTIMATE
+# ============================================================
+
+def get_traffic_estimate(url):
+    api_key = os.getenv("SIMILARWEB_API_KEY")
+    domain = registrable_domain(get_domain(url))
+
+    if not api_key:
+        return {
+            "available": False,
+            "domain": domain,
+            "message": "Traffic data not configured. A suitable API subscription/key is required."
+        }
+
+    # Similarweb API products use different endpoints and permissions.
+    # Do not invent a traffic estimate when no compatible endpoint is configured.
+    return {
+        "available": False,
+        "domain": domain,
+        "message": (
+            "A Similarweb API key was detected, but this app does not yet "
+            "have a verified endpoint configuration for that subscription."
+        )
+    }
+
+
+# ============================================================
+# REPORT GENERATION
+# ============================================================
+
+def run_full_audit(url, do_pagespeed=True, do_links=True):
+    technical = run_technical_audit(url)
+    links = []
+
+    if do_links:
+        links = check_links(technical["details"].get("links", []))
+
+    pagespeed = {
+        "mobile": {"available": False, "error": "Not requested"},
+        "desktop": {"available": False, "error": "Not requested"}
+    }
+
+    if do_pagespeed:
+        pagespeed["mobile"] = get_pagespeed(technical["final_url"], "mobile")
+        pagespeed["desktop"] = get_pagespeed(technical["final_url"], "desktop")
+
+    domain_age = get_domain_age(technical["final_url"])
+    wayback = get_wayback_history(technical["final_url"])
+    traffic = get_traffic_estimate(technical["final_url"])
+
+    return {
+        "app_name": APP_NAME,
+        "app_version": APP_VERSION,
+        "requested_url": url,
+        "final_url": technical["final_url"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "score": technical["score"],
+        "technical": technical,
+        "links": links,
+        "pagespeed": pagespeed,
+        "domain_age": domain_age,
+        "wayback": wayback,
+        "traffic": traffic
+    }
+
+
+def save_report(report):
+    with db_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO reports (url, created_at, score, report_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                report.get("final_url", report.get("requested_url", "")),
+                report.get("created_at", datetime.now(timezone.utc).isoformat()),
+                int(report.get("score", 0)),
+                json.dumps(report, ensure_ascii=False)
+            )
+        )
+        connection.commit()
+        return cursor.lastrowid
+
+
+# ============================================================
+# REPORT HTML
+# ============================================================
+
+def status_text(check):
+    if check.get("passed"):
+        return '<span class="status-pass">PASS</span>'
+    return '<span class="status-warn">REVIEW</span>'
+
+
+def render_checks(checks):
+    rows = []
+
+    for check in checks:
+        rows.append(
+            "<tr>"
+            f"<td>{e(check.get('name'))}</td>"
+            f"<td>{status_text(check)}</td>"
+            f"<td>{e(check.get('details'))}</td>"
+            "</tr>"
+        )
+
+    return (
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>Check</th><th>Result</th><th>Details</th></tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody></table></div>"
+    )
+
+
+def render_links(links):
+    if not links:
+        return "<p class='muted'>No links were checked.</p>"
+
+    rows = []
+
+    for link in links:
+        category = link.get("category", "unknown")
+        css_class = "status-pass" if category == "ok" else (
+            "status-fail" if category == "broken" else "status-warn"
+        )
+
+        status = link.get("status")
+        status_display = status if status is not None else "Not verified"
+
+        rows.append(
+            "<tr>"
+            f"<td>{e(link.get('text') or '(no anchor text)')}</td>"
+            f"<td><a href='{e(link.get('url'))}' target='_blank' rel='noopener noreferrer'>"
+            f"{e(link.get('url'))}</a></td>"
+            f"<td>{e(status_display)}</td>"
+            f"<td class='{css_class}'>{e(link.get('result'))}</td>"
+            "</tr>"
+        )
+
+    return (
+        "<div class='table-wrap'><table>"
+        "<thead><tr><th>Anchor</th><th>URL</th><th>HTTP</th><th>Result</th></tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody></table></div>"
+    )
+
+
+def render_pagespeed(pagespeed):
+    cards = []
+
+    for device in ("mobile", "desktop"):
+        result = pagespeed.get(device, {})
+        title = device.title()
+
+        if not result.get("available"):
+            message = result.get("error", "Data unavailable")
+            cards.append(
+                f"<div class='metric'><h3>{title}</h3>"
+                f"<p class='muted'>{e(message)}</p></div>"
+            )
+            continue
+
+        scores = result.get("scores", {})
+        score_html = "".join(
+            f"<p>{e(key.replace('_', ' ').title())}: "
+            f"<strong>{e(value if value is not None else 'N/A')}</strong></p>"
+            for key, value in scores.items()
+        )
+
+        metric_rows = []
+
+        for key, metric in result.get("metrics", {}).items():
+            display_value = metric.get("display_value") or "Not reported"
+            metric_rows.append(
+                f"<p>{e(metric.get('title', key))}: {e(display_value)}</p>"
+            )
+
+        cards.append(
+            f"<div class='metric'><h3>{title}</h3>"
+            f"{score_html}{''.join(metric_rows)}</div>"
+        )
+
+    return "<div class='grid'>" + "".join(cards) + "</div>"
+
+
+def render_domain_age(data):
+    if not data.get("available"):
+        return (
+            "<p class='status-warn'>Unavailable: "
+            + e(data.get("error", "No data"))
+            + "</p>"
+        )
+
+    return (
+        f"<p><strong>Domain:</strong> {e(data.get('domain'))}</p>"
+        f"<p><strong>Creation date:</strong> {e(data.get('created_at'))}</p>"
+        f"<p><strong>Estimated age:</strong> {e(data.get('age_years'))} years "
+        f"({e(data.get('age_days'))} days)</p>"
+    )
+
+
+def render_wayback(data):
+    if not data.get("available"):
+        return "<p class='status-warn'>Unavailable: " + e(data.get("error", "No data")) + "</p>"
+
+    years = data.get("years", {})
+
+    if not years:
+        return "<p class='muted'>No matching snapshots were returned.</p>"
+
+    rows = []
+
+    for year, count in years.items():
+        rows.append(f"<tr><td>{e(year)}</td><td>{e(count)}</td></tr>")
+
+    return (
+        "<div class='table-wrap'><table><thead><tr><th>Year</th>"
+        "<th>Returned records</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></div><p class='muted small'>"
+        + e(data.get("note", "Counts may be incomplete."))
+        + "</p>"
+    )
+
+
+def render_report(report, report_id=None, lang="en"):
+    technical = report["technical"]
+    details = technical.get("details", {})
+
+    passed = technical.get("passed_checks", 0)
+    total = technical.get("total_checks", 0)
+    score = report.get("score", 0)
+
+    report_id_html = (
+        f"<p class='muted'>Report ID: {e(report_id)}</p>"
+        if report_id is not None else ""
+    )
+
+    body = f"""
+    <div class="card">
+      <div class="no-print" style="display:flex;gap:10px;flex-wrap:wrap">
+        <button onclick="window.print()">Print / Save as PDF</button>
+        <a class="button" href="/?lang={e(lang)}">New audit</a>
+        <a class="button" href="/reports?lang={e(lang)}">Saved reports</a>
+      </div>
+      <h1>SEO Audit Report</h1>
+      {report_id_html}
+      <p><strong>Website:</strong>
+        <a href="{e(report.get('final_url'))}" target="_blank" rel="noopener noreferrer">
+        {e(report.get('final_url'))}</a>
+      </p>
+      <p><strong>Generated:</strong> {e(report.get('created_at'))}</p>
+      <div class="grid">
+        <div class="metric"><span class="muted">Technical checklist score</span>
+          <strong>{e(score)}/100</strong></div>
+        <div class="metric"><span class="muted">Checks passed</span>
+          <strong>{e(passed)}/{e(total)}</strong></div>
+        <div class="metric"><span class="muted">HTTP status</span>
+          <strong>{e(technical.get('http_status'))}</strong></div>
+        <div class="metric"><span class="muted">Links reviewed</span>
+          <strong>{e(len(report.get('links', [])))}</strong></div>
+      </div>
+      <p class="notice">
+        This score measures the listed checks only. It is not a Google ranking
+        score, does not predict rankings, and does not guarantee that every SEO issue
+        has been found.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Technical SEO checks</h2>
+      {render_checks(technical.get('checks', []))}
+    </div>
+
+    <div class="card">
+      <h2>Page information</h2>
+      <div class="grid">
+        <div class="metric"><h3>Title</h3><p>{e(details.get('title') or 'Not found')}</p>
+          <p class="muted">{e(details.get('title_length'))} characters</p></div>
+        <div class="metric"><h3>Meta description</h3>
+          <p>{e(details.get('description') or 'Not found')}</p>
+          <p class="muted">{e(details.get('description_length'))} characters</p></div>
+        <div class="metric"><h3>Canonical</h3><p>{e(details.get('canonical') or 'Not found')}</p></div>
+        <div class="metric"><h3>Images</h3>
+          <p>Total: {e(details.get('image_count'))}</p>
+          <p>Missing alt: {e(details.get('images_missing_alt'))}</p></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>PageSpeed Insights</h2>
+      <p class="muted">Scores and metrics come from Google PageSpeed Insights when available.</p>
+      {render_pagespeed(report.get('pagespeed', {}))}
+    </div>
+
+    <div class="card">
+      <h2>Link check</h2>
+      <p class="muted">403, 429, timeouts and other access restrictions do not automatically mean
+      the destination is broken. Review uncertain results manually.</p>
+      {render_links(report.get('links', []))}
+    </div>
+
+    <div class="card">
+      <h2>Domain registration age</h2>
+      {render_domain_age(report.get('domain_age', {}))}
+    </div>
+
+    <div class="card">
+      <h2>Wayback Machine history</h2>
+      {render_wayback(report.get('wayback', {}))}
+    </div>
+
+    <div class="card">
+      <h2>Traffic estimates</h2>
+      <p>{e(report.get('traffic', {}).get('message', 'No traffic data available.'))}</p>
+    </div>
+    """
+
+    return page_template("SEO Audit Report", body, lang=lang)
+
+
+# ============================================================
+# ROUTES
+# ============================================================
 
 @app.get("/", response_class=HTMLResponse)
-def home(lang: str = "ar"):
-    lang = lang if lang in LANGUAGES else "ar"
-    body = f"""
-<section class="card">
-<h1>{esc(tr(lang, "heading"))}</h1>
-<p>{esc(tr(lang, "intro"))}</p>
-<form method="post" action="/audit">
-<input type="hidden" name="lang" value="{esc(lang)}">
-<label for="url">{esc(tr(lang, "url"))}</label>
-<input id="url" name="url" type="url" placeholder="https://example.com" required maxlength="{MAX_URL_LENGTH}">
-<p class="muted">{esc(tr(lang, "privacy"))}</p>
+def home(lang: str = "en"):
+    lang = "ar" if lang == "ar" else "en"
 
-<div class="card">
-<label style="display:flex;gap:10px;align-items:center">
-<input type="checkbox" name="local_enabled" value="yes" id="local_enabled" style="width:auto">
-<span>{esc(tr(lang, "business_enable"))}</span>
-</label>
-<p class="muted">{esc(tr(lang, "local_note"))}</p>
-
-<div id="local_fields" hidden>
-<label for="business_name">{esc(tr(lang, "business_name"))}</label>
-<input id="business_name" name="business_name" type="text" maxlength="200">
-
-<label for="address">{esc(tr(lang, "address"))}</label>
-<input id="address" name="address" type="text" maxlength="300">
-
-<label style="display:flex;gap:10px;align-items:center">
-<input type="checkbox" name="map_enabled" value="yes" id="map_enabled" style="width:auto">
-<span>{esc(tr(lang, "map_enable"))}</span>
-</label>
-
-<div id="map_fields" hidden>
-<div class="grid">
-<div><label for="latitude">{esc(tr(lang, "latitude"))}</label>
-<input id="latitude" name="latitude" type="number" step="any" min="-90" max="90" placeholder="24.7136"></div>
-<div><label for="longitude">{esc(tr(lang, "longitude"))}</label>
-<input id="longitude" name="longitude" type="number" step="any" min="-180" max="180" placeholder="46.6753"></div>
-</div>
-<p class="muted">{esc(tr(lang, "map_help"))}</p>
-<div id="map" class="map"></div>
-</div>
-</div>
-</div>
-
-<button type="submit">{esc(tr(lang, "audit"))}</button>
-</form>
-</section>
-
-<section class="card">
-<h2>{esc(tr(lang, "history_reports"))}</h2>
-{render_history(lang)}
-</section>
-
-<script>
-const localCheck = document.getElementById('local_enabled');
-const mapCheck = document.getElementById('map_enabled');
-const localFields = document.getElementById('local_fields');
-const mapFields = document.getElementById('map_fields');
-let mapInstance = null;
-let mapMarker = null;
-
-function syncLocal() {{
-  localFields.hidden = !localCheck.checked;
-  if (!localCheck.checked) {{
-    mapCheck.checked = false;
-    mapFields.hidden = true;
-  }}
-}}
-function syncMap() {{
-  mapFields.hidden = !mapCheck.checked || !localCheck.checked;
-  if (!mapFields.hidden) {{
-    loadMap();
-  }}
-}}
-localCheck.addEventListener('change', syncLocal);
-localCheck.addEventListener('change', syncMap);
-mapCheck.addEventListener('change', syncMap);
-
-function loadMap() {{
-  if (mapInstance) {{
-    setTimeout(() => mapInstance.invalidateSize(), 150);
-    return;
-  }}
-  if (!window.L) {{
-    const css = document.createElement('link');
-    css.rel = 'stylesheet';
-    css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
-    document.head.appendChild(css);
-    const script = document.createElement('script');
-    script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
-    script.onload = initMap;
-    document.head.appendChild(script);
-  }} else {{
-    initMap();
-  }}
-}}
-function initMap() {{
-  if (mapInstance || !window.L) return;
-  mapInstance = L.map('map').setView([24.7136, 46.6753], 5);
-  L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-    maxZoom: 19,
-    attribution: '&copy; OpenStreetMap contributors'
-  }}).addTo(mapInstance);
-  mapInstance.on('click', function(e) {{
-    document.getElementById('latitude').value = e.latlng.lat.toFixed(6);
-    document.getElementById('longitude').value = e.latlng.lng.toFixed(6);
-    if (mapMarker) mapMarker.setLatLng(e.latlng);
-    else mapMarker = L.marker(e.latlng).addTo(mapInstance);
-  }});
-  setTimeout(() => mapInstance.invalidateSize(), 200);
-}}
-</script>
-"""
-    return HTMLResponse(layout(lang, body, APP_NAME))
-
-
-def render_history(lang):
-    with get_db() as db:
-        rows = db.execute(
-            "SELECT id,url,title,score,created_at FROM reports ORDER BY id DESC LIMIT 20"
-        ).fetchall()
-
-    if not rows:
-        return f"<p>{esc(tr(lang, 'no_reports'))}</p>"
-
-    result = ["<div style='overflow-x:auto'><table><thead><tr>"]
-    for key in ("date", "website", "score", "actions"):
-        result.append(f"<th>{esc(tr(lang, key))}</th>")
-    result.append("</tr></thead><tbody>")
-
-    for row in rows:
-        result.append(
-            "<tr>"
-            f"<td>{esc(row['created_at'][:19].replace('T',' '))}</td>"
-            f"<td>{esc(row['url'])}</td>"
-            f"<td>{int(row['score'])}/100</td>"
-            "<td class='actions'>"
-            f"<a class='btn secondary' href='/report/{int(row['id'])}?lang={esc(lang)}'>{esc(tr(lang,'view'))}</a>"
-            f"<form method='post' action='/delete/{int(row['id'])}' onsubmit=\"return confirm('Delete report?')\">"
-            f"<input type='hidden' name='lang' value='{esc(lang)}'>"
-            f"<button class='secondary' type='submit'>{esc(tr(lang,'delete'))}</button>"
-            "</form></td></tr>"
+    if lang == "ar":
+        title = "افحص موقعك واكتشف مشكلات SEO التقنية"
+        description = (
+            "أدخل رابط موقعك للحصول على تقرير تقني يتضمن العناوين والوصف "
+            "والروابط وPageSpeed وبيانات النطاق المتاحة."
         )
-    result.append("</tbody></table></div>")
-    return "".join(result)
+        label = "رابط الموقع"
+        placeholder = "https://example.com"
+        button = "ابدأ الفحص"
+        pagespeed_label = "تضمين فحص PageSpeed (قد يستغرق وقتًا)"
+        links_label = "فحص عينة من الروابط"
+        disclaimer = (
+            "درجة الفحص ليست درجة Google ولا تضمن ترتيبًا معينًا. "
+            "تختلف النتائج حسب توفر الخدمات الخارجية."
+        )
+        saved = "عرض التقارير المحفوظة"
+    else:
+        title = "Audit your website and discover technical SEO issues"
+        description = (
+            "Enter a website URL to review technical SEO checks, links, "
+            "PageSpeed, domain registration data and available archive history."
+        )
+        label = "Website URL"
+        placeholder = "https://example.com"
+        button = "Start audit"
+        pagespeed_label = "Include PageSpeed Insights (may take longer)"
+        links_label = "Check a sample of links"
+        disclaimer = (
+            "This checklist score is not a Google score and does not guarantee "
+            "rankings. External data availability varies."
+        )
+        saved = "View saved reports"
+
+    body = f"""
+    <div class="card">
+      <span class="pill">TECHNICAL WEBSITE ANALYSIS</span>
+      <h1>{e(title)}</h1>
+      <p class="muted">{e(description)}</p>
+
+      <form action="/audit" method="post">
+        <input type="hidden" name="lang" value="{e(lang)}">
+        <label for="url">{e(label)}</label>
+        <input id="url" name="url" type="url" required
+               maxlength="2048" placeholder="{e(placeholder)}">
+
+        <label style="font-weight:400">
+          <input type="checkbox" name="do_pagespeed" value="yes" checked>
+          {e(pagespeed_label)}
+        </label>
+
+        <label style="font-weight:400">
+          <input type="checkbox" name="do_links" value="yes" checked>
+          {e(links_label)}
+        </label>
+
+        <p><button type="submit">{e(button)}</button></p>
+      </form>
+      <p class="small muted">{e(disclaimer)}</p>
+    </div>
+
+    <div class="grid">
+      <div class="card"><h3>Technical SEO</h3>
+        <p>Titles, meta descriptions, headings, canonical tags, HTTPS and robots/sitemap checks.</p></div>
+      <div class="card"><h3>PageSpeed</h3>
+        <p>Mobile and desktop data from Google PageSpeed Insights, when available.</p></div>
+      <div class="card"><h3>Domain history</h3>
+        <p>Attempts to retrieve registration information and Wayback Machine records.</p></div>
+    </div>
+    <div class="card">
+      <h2>Reports</h2>
+      <p>Previously saved reports are available on this installation.</p>
+      <a class="button" href="/reports?lang={e(lang)}">{e(saved)}</a>
+    </div>
+    """
+
+    return page_template(APP_NAME, body, lang=lang)
 
 
 @app.post("/audit", response_class=HTMLResponse)
 def audit(
     url: str = Form(...),
-    lang: str = Form("ar"),
-    local_enabled: str = Form(""),
-    map_enabled: str = Form(""),
-    business_name: str = Form(""),
-    address: str = Form(""),
-    latitude: str = Form(""),
-    longitude: str = Form(""),
+    lang: str = Form("en"),
+    do_pagespeed: str = Form("yes"),
+    do_links: str = Form("yes")
 ):
-    lang = lang if lang in LANGUAGES else "ar"
+    lang = "ar" if lang == "ar" else "en"
 
     try:
-        clean_url = validate_public_url(url)
-        page = analyze_page(clean_url)
-    except Exception as exc:
-        logger.info("Audit failed: %s", exc)
-        body = f"""
-<div class="card">
-<h1>{esc(tr(lang, "error"))}</h1>
-<p>{esc(tr(lang, "invalid"))}</p>
-<p class="muted">{esc(tr(lang, "error"))}</p>
-<a class="btn" href="/?lang={esc(lang)}">{esc(tr(lang, "new"))}</a>
-</div>"""
-        return HTMLResponse(layout(lang, body), status_code=400)
-
-    link_results = []
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = [pool.submit(check_one_link, link) for link in page["links"]]
-        for future in as_completed(futures):
-            try:
-                link_results.append(future.result())
-            except Exception:
-                pass
-    link_results.sort(key=lambda x: x["url"])
-
-    robots = check_robots_sitemap(page["final_url"])
-    speed = pagespeed_data(page["final_url"])
-    domain = get_domain_age(page["final_url"])
-    archive = get_wayback_history(page["final_url"])
-    traffic = get_similarweb_data(page["final_url"])
-
-    local = local_business_report(
-        page=page,
-        enabled=(local_enabled == "yes"),
-        map_enabled=(map_enabled == "yes"),
-        name=business_name,
-        address=address,
-        latitude=latitude,
-        longitude=longitude,
-    )
-
-    report = {
-        "url": clean_url,
-        "final_url": page["final_url"],
-        "http_status": page["http_status"],
-        "title": page["title"],
-        "description": page["description"],
-        "canonical": page["canonical"],
-        "score": page["score"],
-        "passed": page["passed"],
-        "total_checks": page["total_checks"],
-        "checks": page["checks"],
-        "links": link_results,
-        "robots_sitemap": robots,
-        "pagespeed": speed,
-        "domain": domain,
-        "archive": archive,
-        "traffic": traffic,
-        "local": local,
-        "created_at": now_iso(),
-    }
-
-    with get_db() as db:
-        cursor = db.execute(
-            "INSERT INTO reports(url,title,score,report_json,created_at) VALUES(?,?,?,?,?)",
-            (
-                clean_url,
-                page["title"],
-                page["score"],
-                json.dumps(report, ensure_ascii=False),
-                now_iso(),
-            ),
+        normalized = normalize_url(url)
+        report = run_full_audit(
+            normalized,
+            do_pagespeed=(do_pagespeed == "yes"),
+            do_links=(do_links == "yes")
         )
-        report_id = cursor.lastrowid
-        db.commit()
+        report_id = save_report(report)
 
-    return RedirectResponse(
-        url=f"/report/{report_id}?lang={lang}",
-        status_code=303,
-    )
+        return HTMLResponse(render_report(report, report_id, lang))
+
+    except ValueError as exc:
+        body = f"""
+        <div class="card">
+          <h1>Invalid URL</h1>
+          <p>{e(exc)}</p>
+          <a class="button" href="/?lang={e(lang)}">Go back</a>
+        </div>
+        """
+        return HTMLResponse(page_template("Invalid URL", body, lang), status_code=400)
+
+    except requests.RequestException as exc:
+        body = f"""
+        <div class="card">
+          <h1>Could not fetch website</h1>
+          <p>The website did not return a usable response.</p>
+          <p class="muted">{e(str(exc)[:500])}</p>
+          <a class="button" href="/?lang={e(lang)}">Try again</a>
+        </div>
+        """
+        return HTMLResponse(page_template("Audit error", body, lang), status_code=502)
+
+    except Exception as exc:
+        body = f"""
+        <div class="card">
+          <h1>Audit failed</h1>
+          <p>An unexpected error interrupted the audit.</p>
+          <p class="muted">{e(str(exc)[:500])}</p>
+          <a class="button" href="/?lang={e(lang)}">Try again</a>
+        </div>
+        """
+        return HTMLResponse(page_template("Audit error", body, lang), status_code=500)
 
 
-@app.get("/report/{report_id}", response_class=HTMLResponse)
-def view_report(report_id: int, lang: str = "ar"):
-    lang = lang if lang in LANGUAGES else "ar"
-    with get_db() as db:
-        row = db.execute(
-            "SELECT report_json FROM reports WHERE id=?",
-            (report_id,),
+@app.get("/reports", response_class=HTMLResponse)
+def reports(lang: str = "en"):
+    lang = "ar" if lang == "ar" else "en"
+
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, url, created_at, score
+            FROM reports
+            ORDER BY id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+
+    table_rows = []
+
+    for row in rows:
+        table_rows.append(
+            "<tr>"
+            f"<td>{e(row['id'])}</td>"
+            f"<td><a href='/reports/{e(row['id'])}?lang={e(lang)}'>{e(row['url'])}</a></td>"
+            f"<td>{e(row['created_at'])}</td>"
+            f"<td>{e(row['score'])}/100</td>"
+            "</tr>"
+        )
+
+    if table_rows:
+        table = (
+            "<div class='table-wrap'><table>"
+            "<thead><tr><th>ID</th><th>Website</th><th>Date (UTC)</th><th>Score</th></tr></thead>"
+            "<tbody>" + "".join(table_rows) + "</tbody></table></div>"
+        )
+    else:
+        table = "<p class='muted'>No saved reports yet.</p>"
+
+    body = f"""
+    <div class="card">
+      <h1>Saved reports</h1>
+      <p class="muted">The latest 100 saved reports are listed here.</p>
+      {table}
+      <p><a class="button" href="/?lang={e(lang)}">Start a new audit</a></p>
+    </div>
+    """
+
+    return page_template("Saved reports", body, lang)
+
+
+@app.get("/reports/{report_id}", response_class=HTMLResponse)
+def report_detail(report_id: int, lang: str = "en"):
+    lang = "ar" if lang == "ar" else "en"
+
+    with db_connection() as connection:
+        row = connection.execute(
+            "SELECT report_json FROM reports WHERE id = ?",
+            (report_id,)
         ).fetchone()
 
     if not row:
-        return HTMLResponse(
-            layout(lang, f"<div class='card'><h1>Report not found</h1><a href='/?lang={esc(lang)}'>{esc(tr(lang,'new'))}</a></div>"),
-            status_code=404,
-        )
+        raise HTTPException(status_code=404, detail="Report not found")
 
-    report = json.loads(row["report_json"])
-    score = int(report.get("score", 0))
-    passed = int(report.get("passed", 0))
-    total = int(report.get("total_checks", 0))
-    failed = max(0, total - passed)
-    domain = report.get("domain") or {}
-    archive = report.get("archive") or []
-    traffic = report.get("traffic")
-    speed = report.get("pagespeed")
-    local = report.get("local")
+    try:
+        report = json.loads(row["report_json"])
+    except (TypeError, json.JSONDecodeError):
+        raise HTTPException(status_code=500, detail="Saved report could not be read")
 
-    checks_html = []
-    for check in report.get("checks", []):
-        status = "pill" if check["passed"] else "pill fail"
-        symbol = "✓" if check["passed"] else "!"
-        checks_html.append(
-            f"<tr><td><span class='{status}'>{symbol}</span></td>"
-            f"<td><strong>{esc(check['label'])}</strong></td>"
-            f"<td>{esc(check['detail'])}</td></tr>"
-        )
-
-    robots = report.get("robots_sitemap") or {}
-    robots_rows = []
-    for key in ("robots", "sitemap"):
-        item = robots.get(key) or {}
-        robots_rows.append({
-            "type": key,
-            "url": item.get("url", ""),
-            "status": item.get("status", "Unknown"),
-            "result": "Found" if item.get("status", 0) == 200 else "Review",
-        })
-
-    link_html = render_table(
-        report.get("links", []),
-        [("url", "URL"), ("status", "HTTP"), ("result", "Result")],
-    )
-
-    domain_age = domain.get("age_years")
-    age_text = (
-        f"{domain_age} {esc(tr(lang,'years'))}"
-        if domain_age is not None
-        else esc(tr(lang, "unknown"))
-    )
-
-    domain_card = f"""
-<div class="card">
-<h2>{esc(tr(lang,'domain_age'))}</h2>
-<div class="grid">
-<div><div class="muted">{esc(tr(lang,'domain_age'))}</div><div class="kpi">{age_text}</div></div>
-<div><div class="muted">{esc(tr(lang,'created'))}</div><div class="kpi" style="font-size:19px">{esc(domain.get('created') or tr(lang,'unknown'))}</div></div>
-</div>
-<p class="muted">{esc(tr(lang,'source'))}: RDAP. Domain registration age may differ from the age of the website itself.</p>
-</div>"""
-
-    archive_chart = ""
-    if archive:
-        archive_chart = line_chart_svg(
-            archive, "year", "count", tr(lang, "archive"), "#7c3aed"
-        )
-        archive_table = render_table(
-            archive, [("year", "Year"), ("count", "Archived snapshots")]
-        )
-    else:
-        archive_chart = f"<div class='card'><h2>{esc(tr(lang,'history'))}</h2><p>{esc(tr(lang,'no_archive'))}</p></div>"
-        archive_table = ""
-
-    traffic_section = ""
-    if traffic and traffic.get("monthly"):
-        traffic_section = line_chart_svg(
-            traffic["monthly"], "month", "visits", tr(lang, "visits"), "#0891b2"
-        )
-        traffic_section += f"<p class='muted'>{esc(tr(lang,'source'))}: {esc(traffic.get('source','External provider'))}. These are estimates, not verified analytics.</p>"
-        traffic_section += render_table(
-            traffic["monthly"],
-            [("month", "Month"), ("visits", "Estimated visits")],
-        )
-    else:
-        traffic_section = (
-            f"<div class='card'><h2>{esc(tr(lang,'visits'))}</h2>"
-            f"<p>{esc(tr(lang,'no_visits'))}</p>"
-            "<p class='muted'>To enable traffic estimates, configure SIMILARWEB_API_KEY in the server environment. Availability depends on the provider and subscription.</p></div>"
-        )
-
-    speed_section = ""
-    if speed:
-        speed_rows = [{"metric": k.title(), "score": v} for k, v in speed.items()]
-        speed_section = (
-            f"<div class='card'><h2>{esc(tr(lang,'speed'))}</h2>"
-            + render_table(speed_rows, [("metric", "Metric"), ("score", "Score / 100")])
-            + "</div>"
-        )
-        speed_chart_items = [{"metric": k.title(), "score": v} for k, v in speed.items()]
-        speed_section += line_chart_svg(speed_chart_items, "metric", "score", tr(lang, "speed"), "#0f766e")
-    else:
-        speed_section = f"<div class='card'><h2>{esc(tr(lang,'speed'))}</h2><p>{esc(tr(lang,'speed_none'))}</p></div>"
-
-    local_section = ""
-    if local:
-        coords = local.get("coordinates")
-        coord_text = (
-            f"{coords['latitude']}, {coords['longitude']}"
-            if coords else tr(lang, "no_location")
-        )
-        map_html = ""
-        if coords:
-            lat = coords["latitude"]
-            lon = coords["longitude"]
-            map_html = f"""
-<div class="card">
-<h3>{esc(tr(lang,'business'))}</h3>
-<p><strong>{esc(local.get('name') or tr(lang,'unknown'))}</strong></p>
-<p>{esc(local.get('address') or tr(lang,'unknown'))}</p>
-<p>{esc(coord_text)}</p>
-<p><a href="https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=14/{lat}/{lon}" target="_blank" rel="noopener noreferrer">Open location in OpenStreetMap</a></p>
-</div>"""
-        else:
-            map_html = f"<div class='card'><h3>{esc(tr(lang,'business'))}</h3><p>{esc(local.get('name') or tr(lang,'unknown'))}</p><p>{esc(local.get('address') or tr(lang,'unknown'))}</p><p>{esc(tr(lang,'no_location'))}</p></div>"
-
-        local_issues = "".join(f"<li>{esc(x)}</li>" for x in local.get("issues", []))
-        local_section = f"""
-<div class="card">
-<h2>{esc(tr(lang,'local_result'))}</h2>
-<p>{esc(tr(lang,'business'))}: {esc(local.get('name') or tr(lang,'unknown'))}</p>
-<p>{esc(tr(lang,'address'))}: {esc(local.get('address') or tr(lang,'unknown'))}</p>
-<p>Structured local business data: {"Detected" if local.get('structured_business_detected') else esc(tr(lang,'no_business'))}</p>
-<ul>{local_issues}</ul>
-</div>{map_html}"""
-
-    score_cards = f"""
-<div class="card">
-<div class="scorebox">
-{donut_svg(score, passed, total)}
-<div>
-<h1>{esc(tr(lang,'report'))}</h1>
-<div class="kpi">{score}/100</div>
-<p>{esc(tr(lang,'not_rank'))}</p>
-<p><span class="pill">{passed} {esc(tr(lang,'passed'))}</span>
-<span class="pill warn">{failed} {esc(tr(lang,'issues'))}</span></p>
-<p><a href="{esc(report.get('final_url',''))}" target="_blank" rel="noopener noreferrer">{esc(report.get('final_url',''))}</a></p>
-<p class="muted">{esc(tr(lang,'report_id'))}: {report_id} · {esc(report.get('created_at','')[:19])}</p>
-</div>
-</div>
-<hr style="border:0;border-top:1px solid #dce4ef;margin:18px 0">
-<div class="grid">
-<div><h3>{esc(tr(lang,'score'))}</h3>{donut_svg(score, passed, total)}</div>
-<div><h3>Check distribution</h3>{pie_svg(passed, failed)}</div>
-</div>
-</div>"""
-
-    body = f"""
-<div class="actions no-print">
-<a class="btn secondary" href="/?lang={esc(lang)}">{esc(tr(lang,'new'))}</a>
-<button onclick="window.print()">{esc(tr(lang,'print'))}</button>
-</div>
-{score_cards}
-{domain_card}
-{archive_chart}
-{archive_table}
-{traffic_section}
-{speed_section}
-
-<div class="card">
-<h2>{esc(tr(lang,'sitemap'))}</h2>
-{render_table(robots_rows, [('type','Type'),('url','URL'),('status','HTTP'),('result','Result')])}
-</div>
-
-<div class="card">
-<h2>{esc(tr(lang,'links'))}</h2>
-<p class="muted">{esc(tr(lang,'sample'))}</p>
-{link_html}
-</div>
-
-<div class="card">
-<h2>{esc(tr(lang,'details'))}</h2>
-{pie_svg(passed, failed)}
-<div style="overflow-x:auto"><table><thead><tr><th></th><th>Check</th><th>Finding</th></tr></thead>
-<tbody>{''.join(checks_html)}</tbody></table></div>
-</div>
-
-{local_section}
-
-<div class="card">
-<h2>{esc(tr(lang,'security'))}</h2>
-<p>{esc(tr(lang,'privacy'))}</p>
-<p class="muted">{esc(tr(lang,'saved'))}</p>
-</div>
-"""
-    return HTMLResponse(layout(lang, body, f"{APP_NAME} Report #{report_id}"))
-
-
-@app.post("/delete/{report_id}")
-def delete_report(report_id: int, lang: str = Form("ar")):
-    lang = lang if lang in LANGUAGES else "ar"
-    with get_db() as db:
-        db.execute("DELETE FROM reports WHERE id=?", (report_id,))
-        db.commit()
-    return RedirectResponse(url=f"/?lang={lang}", status_code=303)
+    return HTMLResponse(render_report(report, report_id, lang))
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "app": APP_NAME, "version": APP_VERSION}
+    return JSONResponse({
+        "status": "ok",
+        "app": APP_NAME,
+        "version": APP_VERSION,
+        "time_utc": datetime.now(timezone.utc).isoformat()
+    })
+
+
+@app.get("/robots.txt", include_in_schema=False)
+def app_robots():
+    return HTMLResponse(
+        "User-agent: *\nAllow: /\nDisallow: /health\n",
+        media_type="text/plain"
+    )
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return RedirectResponse(url="https://www.google.com/s2/favicons?domain=github.com")
+
+
+@app.get("/api/report/{report_id}")
+def report_json(report_id: int):
+    with db_connection() as connection:
+        row = connection.execute(
+            "SELECT report_json FROM reports WHERE id = ?",
+            (report_id,)
+        ).fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    try:
+        return JSONResponse(json.loads(row["report_json"]))
+    except (TypeError, json.JSONDecodeError):
+        raise HTTPException(status_code=500, detail="Saved report could not be read")
